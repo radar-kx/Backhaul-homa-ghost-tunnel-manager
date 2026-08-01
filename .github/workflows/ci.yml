@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  shell:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install ShellCheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+
+      - name: Bash syntax
+        run: bash tests/run.sh
+
+      - name: ShellCheck
+        run: |
+          shellcheck \
+            install.sh \
+            uninstall.sh \
+            lib/common.sh \
+            bin/backhaul-manager \
+            bin/backhaul-menu \
+            bin/bh \
+            tests/run.sh \
+            tests/health_repair.sh \
+            tests/install_upgrade.sh \
+            tests/manager_edges.sh \
+            tests/deploy_rollback.sh \
+            tests/menu_flow.sh \
+            tests/uninstall.sh \
+            tests/backup_restore.sh \
+            tests/binary_rollback.sh \
+            tests/release_update.sh

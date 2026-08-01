@@ -1,0 +1,11 @@
+*.bak.*
+*.log
+*.tar.gz
+.idea/
+.vscode/
+.DS_Store
+
+# فایل‌هایی که ممکن است توکن واقعی داخل آن‌ها ذخیره شود
+*.secret
+*.token
+client-install-*.sh

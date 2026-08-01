@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+if (($# == 0)); then
+    exec "${BH_MENU_BIN:-/usr/local/sbin/backhaul-menu}"
+fi
+
+exec "${BH_MANAGER_BIN:-/usr/local/sbin/backhaul-manager}" "$@"

@@ -1,0 +1,1105 @@
+#!/usr/bin/env bash
+# An interactive menu must handle individual command failures without exiting.
+set -Euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -r "${BH_PROJECT_DIR:-/opt/backhaul-tunnel-manager}/lib/common.sh" ]]; then
+    # shellcheck source=/opt/backhaul-tunnel-manager/lib/common.sh
+    # shellcheck disable=SC1091
+    source "${BH_PROJECT_DIR:-/opt/backhaul-tunnel-manager}/lib/common.sh"
+else
+    # shellcheck source=../lib/common.sh
+    # shellcheck disable=SC1091
+    source "$SCRIPT_DIR/../lib/common.sh"
+fi
+
+BH_NORMAL_SCREEN_ACTIVE=0
+BH_TERMINAL_RESTORED=0
+BH_STTY_ACTIVE=0
+BH_STTY_SAVED=""
+BH_TERM_ROWS=0
+BH_TERM_COLUMNS=0
+
+is_terminal() {
+    [[ (-t 0 && (-t 1 || -t 2)) || "${BH_FORCE_TTY:-0}" == "1" ]]
+}
+
+terminal_row_count() {
+    local rows="${BH_TERM_ROWS_OVERRIDE:-}"
+    if [[ ! "$rows" =~ ^[0-9]+$ ]] ||
+       ((rows < 12 || rows > 500)); then
+        if command -v tput >/dev/null 2>&1 &&
+           [[ "${TERM:-dumb}" != "dumb" ]]; then
+            rows="$(tput lines 2>/dev/null || true)"
+        fi
+    fi
+    if [[ ! "$rows" =~ ^[0-9]+$ ]] ||
+       ((rows < 12 || rows > 500)); then
+        rows="${LINES:-}"
+    fi
+    if [[ ! "$rows" =~ ^[0-9]+$ ]] ||
+       ((rows < 12 || rows > 500)); then
+        rows=24
+    fi
+    printf '%s\n' "$rows"
+}
+
+terminal_column_count() {
+    local columns="${BH_TERM_COLUMNS_OVERRIDE:-}"
+    if [[ ! "$columns" =~ ^[0-9]+$ ]] ||
+       ((columns < 20 || columns > 500)); then
+        if command -v tput >/dev/null 2>&1 &&
+           [[ "${TERM:-dumb}" != "dumb" ]]; then
+            columns="$(tput cols 2>/dev/null || true)"
+        fi
+    fi
+    if [[ ! "$columns" =~ ^[0-9]+$ ]] ||
+       ((columns < 20 || columns > 500)); then
+        columns="${COLUMNS:-}"
+    fi
+    if [[ ! "$columns" =~ ^[0-9]+$ ]] ||
+       ((columns < 20 || columns > 500)); then
+        columns=80
+    fi
+    printf '%s\n' "$columns"
+}
+
+strip_menu_colors() {
+    local text="$1"
+    local color
+    for color in "$BH_RED" "$BH_GREEN" "$BH_YELLOW" "$BH_BLUE" "$BH_CYAN" "$BH_RESET"; do
+        [[ -n "$color" ]] || continue
+        text="${text//$color/}"
+    done
+    printf '%s' "$text"
+}
+
+fit_menu_text() {
+    local text
+    text="$(strip_menu_colors "$1")"
+    local maximum="$2"
+    ((maximum > 0)) || return 0
+    if ((${#text} <= maximum)); then
+        printf '%s' "$text"
+    elif ((maximum <= 3)); then
+        printf '%s' "${text:0:maximum}"
+    else
+        printf '%s...' "${text:0:maximum-3}"
+    fi
+}
+
+terminal_cursor_row() {
+    local result_variable="$1"
+    local override="${BH_TERM_CURSOR_ROW_OVERRIDE:-}"
+    local response="" position="" row="" column=""
+
+    if [[ "$override" =~ ^[0-9]+$ ]] &&
+       ((override >= 1 && override <= BH_TERM_ROWS)); then
+        printf -v "$result_variable" '%s' "$override"
+        return 0
+    fi
+
+    [[ -t 0 ]] || return 1
+    terminal_input_begin || return 1
+
+    # Ask the terminal for its current cursor position. The response has the
+    # form ESC[row;columnR and is read while echo is disabled, so it never
+    # appears as text in the menu.
+    if [[ -t 2 ]]; then
+        printf '\033[6n' >&2
+    elif [[ -t 1 ]]; then
+        printf '\033[6n'
+    else
+        terminal_input_end
+        return 1
+    fi
+    IFS= read -r -s -d R -t "${BH_CURSOR_QUERY_TIMEOUT:-0.8}" response || true
+    terminal_input_end
+
+    [[ "$response" == *$'\033['*';'* ]] || return 1
+    position="${response##*$'\033['}"
+    row="${position%%;*}"
+    column="${position#*;}"
+    [[ "$row" =~ ^[0-9]+$ && "$column" =~ ^[0-9]+$ ]] || return 1
+    ((row >= 1 && row <= BH_TERM_ROWS)) || return 1
+    printf -v "$result_variable" '%s' "$row"
+}
+
+scroll_visible_prefix_to_history() {
+    local cursor_row="$1"
+    local row_index scroll_count
+
+    [[ "$cursor_row" =~ ^[0-9]+$ ]] || return 1
+    ((cursor_row >= 1 && cursor_row <= BH_TERM_ROWS)) || return 1
+    scroll_count=$((cursor_row - 1))
+
+    # Only the rows actually used before the cursor are moved to scrollback.
+    # Moving a full terminal height would add an artificial blank page between
+    # the old shell output and the prompt shown after leaving `bh`.
+    if ((scroll_count > 0)); then
+        printf '\033[%d;1H' "$BH_TERM_ROWS"
+        for ((row_index = 0; row_index < scroll_count; row_index++)); do
+            printf '\r\n'
+        done
+    fi
+    printf '\033[H'
+}
+
+archive_current_view() {
+    local cursor_row=""
+
+    is_terminal || return 0
+    [[ "${TERM:-dumb}" != "dumb" ]] || return 0
+    BH_TERM_ROWS="$(terminal_row_count)"
+    terminal_cursor_row cursor_row || return 1
+    scroll_visible_prefix_to_history "$cursor_row"
+}
+
+terminal_enter() {
+    is_terminal || return 0
+    [[ "${TERM:-dumb}" != "dumb" ]] || return 0
+
+    BH_TERM_ROWS="$(terminal_row_count)"
+    BH_TERM_COLUMNS="$(terminal_column_count)"
+    BH_NORMAL_SCREEN_ACTIVE=1
+
+    # Stay in the terminal's normal buffer so Termius touch scrolling can
+    # still reach commands and output from before `bh`. Preserve only the
+    # occupied rows above the current cursor; never manufacture a full blank
+    # page and never emit CSI 3 J (erase scrollback).
+    if ! archive_current_view; then
+        # A terminal without cursor-position reporting cannot be archived
+        # precisely. Prefer a clean normal-buffer viewport over inserting a
+        # guessed number of blank lines into the user's history.
+        printf '\033[H'
+    fi
+}
+
+terminal_leave() {
+    ((BH_TERMINAL_RESTORED == 0)) || return 0
+    BH_TERMINAL_RESTORED=1
+    terminal_input_end
+    printf '%s' "$BH_RESET"
+
+    if ((BH_NORMAL_SCREEN_ACTIVE == 1)) && is_terminal; then
+        clear_screen
+        BH_NORMAL_SCREEN_ACTIVE=0
+    fi
+}
+
+handle_exit() {
+    local status=$?
+    trap - EXIT HUP TERM
+    terminal_leave
+    return "$status"
+}
+
+pause_menu() {
+    printf '\n'
+    read -r -p "Press Enter to continue..." _ || return 1
+
+    # Operation/status pages are temporary UI views. Do not push them into
+    # the normal buffer's scrollback when returning to a menu; Termius would
+    # otherwise show every previous status and backup page above the current
+    # HOMA frame. The shell history from before `bh` remains untouched.
+    if ((BH_NORMAL_SCREEN_ACTIVE == 1)) && is_terminal; then
+        clear_screen
+    fi
+}
+
+clear_screen() {
+    if is_terminal || [[ "${BH_FORCE_CLEAR:-0}" == "1" ]]; then
+        # Clear only the visible viewport. CSI 3 J is intentionally forbidden:
+        # it destroys the history the user expects to reach by touch scrolling.
+        printf '\033[2J\033[H'
+    fi
+}
+
+finish_menu_frame() {
+    # A full-height menu can place its prompt on the terminal's last row.
+    # Printing a newline after Enter would then scroll the HOMA header into the
+    # normal buffer's history. Erase the current menu in place before its
+    # caller prints a submenu or command output. Write the control sequence to
+    # stderr because select_unit is used inside command substitution.
+    if ((BH_NORMAL_SCREEN_ACTIVE == 1)) && is_terminal; then
+        printf '\033[2J\033[H' >&2
+    else
+        printf '\n' >&2
+    fi
+}
+
+terminal_input_begin() {
+    [[ -t 0 ]] || return 1
+    command -v stty >/dev/null 2>&1 || return 1
+    ((BH_STTY_ACTIVE == 0)) || return 0
+
+    BH_STTY_SAVED="$(stty -g <&0 2>/dev/null)" || {
+        BH_STTY_SAVED=""
+        return 1
+    }
+    if ! stty -echo -icanon min 1 time 0 <&0 2>/dev/null; then
+        BH_STTY_SAVED=""
+        return 1
+    fi
+    BH_STTY_ACTIVE=1
+}
+
+terminal_input_end() {
+    ((BH_STTY_ACTIVE == 1)) || return 0
+    if [[ -n "$BH_STTY_SAVED" ]]; then
+        stty "$BH_STTY_SAVED" <&0 2>/dev/null || true
+    fi
+    BH_STTY_ACTIVE=0
+    BH_STTY_SAVED=""
+}
+
+menu_has_key_navigation() {
+    is_terminal &&
+        [[ "${TERM:-dumb}" != "dumb" ]] &&
+        [[ "${BH_DISABLE_KEY_NAVIGATION:-0}" != "1" ]] &&
+        command -v stty >/dev/null 2>&1
+}
+
+menu_value_exists() {
+    local wanted="$1"
+    shift
+    local entry
+    for entry in "$@"; do
+        [[ "${entry%%|*}" == "$wanted" ]] && return 0
+    done
+    return 1
+}
+
+render_menu_choice_line() {
+    local selected="$1"
+    local entry="$2"
+    local columns="${BH_TERM_COLUMNS:-80}"
+    local label_width=$((columns - 7))
+    local value label fitted_label
+    ((label_width >= 4)) || label_width=4
+
+    value="${entry%%|*}"
+    label="${entry#*|}"
+    fitted_label="$(fit_menu_text "$label" "$label_width")"
+
+    if ((selected == 1)); then
+        printf '\r\033[2K%s> %s) %s%s' \
+            "$BH_CYAN" "$value" "$fitted_label" "$BH_RESET" >&2
+    else
+        printf '\r\033[2K  %s) %s' "$value" "$fitted_label" >&2
+    fi
+}
+
+render_menu_prompt() {
+    local typed_number="$1"
+    local prompt="$2"
+    local columns="${BH_TERM_COLUMNS:-80}"
+    local prompt_text=""
+
+    if ((columns < 58)); then
+        prompt_text="Choice:"
+    else
+        prompt_text="$(fit_menu_text "$prompt" $((columns - 39)))"
+        prompt_text+=": [Up/Down + Enter or number]"
+    fi
+    prompt_text="$(fit_menu_text "$prompt_text" $((columns - 2 - ${#typed_number})))"
+    printf '\r\033[2K%s %s' "$prompt_text" "$typed_number" >&2
+}
+
+render_menu_choices() {
+    local selected_index="$1"
+    local typed_number="$2"
+    local prompt="$3"
+    shift 3
+
+    local entry index=0
+    for entry in "$@"; do
+        if ((index == selected_index)); then
+            render_menu_choice_line 1 "$entry"
+        else
+            render_menu_choice_line 0 "$entry"
+        fi
+        printf '\n' >&2
+        index=$((index + 1))
+    done
+    render_menu_prompt "$typed_number" "$prompt"
+}
+
+redraw_menu_choice_at() {
+    local index="$1"
+    local selected="$2"
+    local entry_count="$3"
+    local entry="$4"
+    local offset=$((entry_count - index))
+
+    # The cursor lives on the prompt row. Update only the old and new
+    # selection rows, then return to the prompt. Repainting the complete menu
+    # for every arrow key caused a visible full-screen flash in Termius.
+    printf '\r\033[%dA' "$offset" >&2
+    render_menu_choice_line "$selected" "$entry"
+    printf '\r\033[%dB' "$offset" >&2
+}
+
+menu_select() {
+    local result_variable="$1"
+    local prompt="$2"
+    shift 2
+    local -a entries=("$@")
+    local selection=""
+
+    ((${#entries[@]} > 0)) || {
+        warn "The menu has no selectable items."
+        return 1
+    }
+
+    if ! menu_has_key_navigation; then
+        local entry value label
+        for entry in "${entries[@]}"; do
+            value="${entry%%|*}"
+            label="${entry#*|}"
+            printf ' %s) %s\n' "$value" "$label" >&2
+        done
+        printf '\n%s: ' "$prompt" >&2
+        IFS= read -r selection || return 1
+        finish_menu_frame
+        printf -v "$result_variable" '%s' "$selection"
+        return 0
+    fi
+
+    local selected_index=0
+    local previous_selected_index=0
+    local typed_number=""
+    local previous_typed_number=""
+    local key="" sequence="" suffix=""
+    local read_status=0
+    local escape_index=0
+    local entry_count="${#entries[@]}"
+    terminal_input_begin || return 1
+    render_menu_choices "$selected_index" "$typed_number" "$prompt" \
+        "${entries[@]}"
+
+    while true; do
+        key=""
+        IFS= read -rsN1 -t 1 key
+        read_status=$?
+        if ((read_status > 128)); then
+            continue
+        fi
+        if ((read_status != 0)); then
+            terminal_input_end
+            finish_menu_frame
+            return 1
+        fi
+
+        previous_selected_index="$selected_index"
+        previous_typed_number="$typed_number"
+
+        case "$key" in
+            ''|$'\n'|$'\r')
+                if [[ -n "$typed_number" ]]; then
+                    selection="$typed_number"
+                else
+                    selection="${entries[$selected_index]%%|*}"
+                fi
+                break
+                ;;
+            [0-9])
+                typed_number+="$key"
+                ;;
+            $'\177'|$'\b')
+                [[ -n "$typed_number" ]] &&
+                    typed_number="${typed_number%?}"
+                ;;
+            $'\e')
+                sequence=""
+                suffix=""
+                IFS= read -rsN1 -t 0.2 sequence || true
+                if [[ "$sequence" == "[" ]]; then
+                    for ((escape_index = 0; escape_index < 8; escape_index++)); do
+                        suffix=""
+                        IFS= read -rsN1 -t 0.2 suffix || true
+                        [[ -n "$suffix" ]] || break
+                        sequence+="$suffix"
+                        [[ "$suffix" == [A-Za-z~] ]] && break
+                    done
+                elif [[ "$sequence" == "O" ]]; then
+                    IFS= read -rsN1 -t 0.2 suffix || true
+                    sequence+="$suffix"
+                fi
+                case "$sequence" in
+                    \[*A|'OA')
+                        selected_index=$(((selected_index - 1 + entry_count) % entry_count))
+                        typed_number=""
+                        ;;
+                    \[*B|'OB')
+                        selected_index=$(((selected_index + 1) % entry_count))
+                        typed_number=""
+                        ;;
+                    \[*H|'OH')
+                        selected_index=0
+                        typed_number=""
+                        ;;
+                    \[*F|'OF')
+                        selected_index=$((entry_count - 1))
+                        typed_number=""
+                        ;;
+                    '')
+                        if menu_value_exists "0" "${entries[@]}"; then
+                            selection="0"
+                            break
+                        fi
+                        ;;
+                esac
+                ;;
+        esac
+
+        if ((selected_index != previous_selected_index)); then
+            redraw_menu_choice_at \
+                "$previous_selected_index" 0 "$entry_count" \
+                "${entries[$previous_selected_index]}"
+            redraw_menu_choice_at \
+                "$selected_index" 1 "$entry_count" \
+                "${entries[$selected_index]}"
+        fi
+        if [[ "$typed_number" != "$previous_typed_number" ]] ||
+           ((selected_index != previous_selected_index)); then
+            render_menu_prompt "$typed_number" "$prompt"
+        fi
+    done
+
+    terminal_input_end
+    finish_menu_frame
+    printf -v "$result_variable" '%s' "$selection"
+    return 0
+}
+
+print_homa_logo() {
+    printf '%s' "$BH_BLUE"
+    cat <<'EOF'
+ _   _  ___  __  __    _
+| | | |/ _ \|  \/  |  / \
+| |_| | | | | |\/| | / _ \
+|  _  | |_| | |  | |/ ___ \
+|_| |_|\___/|_|  |_/_/   \_\
+EOF
+    printf '%s' "$BH_RESET"
+}
+
+header() {
+    local compact_header=0
+    local ultra_compact=0
+
+    if is_terminal; then
+        BH_TERM_ROWS="$(terminal_row_count)"
+        BH_TERM_COLUMNS="$(terminal_column_count)"
+    fi
+    clear_screen
+
+    # A complete five-line HOMA logo plus the ten-option main menu fits in a
+    # 20-row viewport. Keep the brand visible on narrow phones whenever height
+    # permits; width alone must never remove the logo. Only genuinely short
+    # viewports use a one-line HOMA badge to prevent automatic terminal scroll.
+    if ((BH_TERM_ROWS > 0 && BH_TERM_ROWS < 20)); then
+        ultra_compact=1
+    elif ((BH_TERM_COLUMNS > 0 && BH_TERM_COLUMNS < 72)); then
+        compact_header=1
+    fi
+
+    if ((ultra_compact == 1)); then
+        printf '%s[ HOMA ] HOMA GHOST v%s%s\n' \
+            "$BH_CYAN" "$BH_MANAGER_VERSION" "$BH_RESET"
+        return 0
+    fi
+
+    if ((compact_header == 1)); then
+        print_homa_logo
+        printf '%sHOMA GHOST TUNNEL MANAGER v%s%s\n' \
+            "$BH_CYAN" "$BH_MANAGER_VERSION" "$BH_RESET"
+        display_server_info compact
+        return 0
+    fi
+
+    print_homa_logo
+    printf '%sHOMA GHOST TUNNEL MANAGER%s\n' "$BH_CYAN" "$BH_RESET"
+    printf '%sManager version: %s%s\n' \
+        "$BH_GREEN" "$BH_MANAGER_VERSION" "$BH_RESET"
+    printf 'Repository: radar-kx/Backhaul-homa-ghost-tunnel-manager\n'
+    display_server_info full
+}
+
+display_server_info() {
+    local mode="${1:-full}"
+    local os_name="unknown"
+    local core_version="not-installed"
+    local total=0 active=0 unit
+    if [[ -r /etc/os-release ]]; then
+        # shellcheck disable=SC1091
+        os_name="$(. /etc/os-release; printf '%s' "${PRETTY_NAME:-unknown}")"
+    fi
+    if [[ -x "$BH_BIN" ]]; then
+        core_version="$("$BH_BIN" --version 2>/dev/null | head -n 1 || true)"
+        core_version="${core_version:-installed}"
+    fi
+    while IFS= read -r unit; do
+        [[ -n "$unit" ]] || continue
+        total=$((total + 1))
+        if command -v systemctl >/dev/null 2>&1 &&
+           systemctl is-active --quiet "$unit" >/dev/null 2>&1; then
+            active=$((active + 1))
+        fi
+    done < <(discover_backhaul_units)
+
+    if [[ "$mode" == "compact" ]]; then
+        local summary="Tunnels: ${active}/${total} active | Core: ${core_version}"
+        printf '%s\n' "$(fit_menu_text "$summary" $((BH_TERM_COLUMNS - 1)))"
+        return 0
+    fi
+
+    printf '%s==========================================================%s\n' \
+        "$BH_YELLOW" "$BH_RESET"
+    printf 'Server: %s | System: %s\n' "$(hostname)" "$os_name"
+    printf 'Backhaul core: %s\n' "$core_version"
+    printf 'Tunnels: %s%d active%s of %d | Health cron: ' \
+        "$BH_GREEN" "$active" "$BH_RESET" "$total"
+    if [[ -r "$BH_CRON_FILE" ]]; then
+        printf '%senabled%s\n' "$BH_GREEN" "$BH_RESET"
+    else
+        printf '%sdisabled%s\n' "$BH_YELLOW" "$BH_RESET"
+    fi
+    printf '%s==========================================================%s\n' \
+        "$BH_YELLOW" "$BH_RESET"
+    if ((BH_TERM_ROWS == 0 || BH_TERM_ROWS >= 28)); then
+        printf '\n'
+    fi
+}
+
+confirm() {
+    local prompt="$1"
+    local answer=""
+    read -r -p "$prompt [y/N]: " answer || return 1
+    [[ "$answer" == "y" || "$answer" == "Y" ]]
+}
+
+select_unit() {
+    local prompt="${1:-Select a Backhaul service}"
+    local -a units=()
+    local -a choices=()
+    local unit current choice index
+    mapfile -t units < <(discover_backhaul_units)
+    ((${#units[@]} > 0)) || {
+        warn "No Backhaul service was found."
+        return 1
+    }
+
+    if ((${#units[@]} == 1)); then
+        printf '%s\n' "${units[0]}"
+        return 0
+    fi
+
+    for index in "${!units[@]}"; do
+        unit="${units[$index]}"
+        current="$(systemctl_state is-active "$unit")"
+        choices+=("$((index + 1))|$unit [${current:-unknown}]")
+    done
+    menu_select choice "$prompt" "${choices[@]}" || return 1
+    [[ "$choice" =~ ^[0-9]+$ ]] || {
+        warn "Invalid selection."
+        return 1
+    }
+    ((choice >= 1 && choice <= ${#units[@]})) || {
+        warn "The selected number is outside the list."
+        return 1
+    }
+    printf '%s\n' "${units[$((choice - 1))]}"
+}
+
+show_dashboard() {
+    printf '=== Tunnel status ===\n'
+    "$BH_MANAGER_BIN" list
+    printf '\n=== Automatic health-check status ===\n'
+    "$BH_MANAGER_BIN" cron status
+}
+
+follow_service_logs() {
+    local unit="$1"
+    # Keep the menu alive when Ctrl+C stops journalctl. Child processes reset
+    # caught traps to their default behavior, so journalctl still terminates.
+    trap ':' INT
+    journalctl -u "$unit" -n 100 -f || true
+    trap - INT
+}
+
+mapping_menu() {
+    local unit="$1"
+    local config role choice="" mapping="" public_port=""
+    config="$(unit_config_path "$unit" 2>/dev/null || true)"
+    role="$(unit_role_from_config "$config")"
+    if [[ "$role" != "server" ]]; then
+        warn "Port mappings are managed on the Iran server side."
+        pause_menu || true
+        return 0
+    fi
+
+    clear_screen
+    printf '%sPort mappings: %s%s\n\n' "$BH_CYAN" "$unit" "$BH_RESET"
+    menu_select choice "Selection" \
+        "1|Show mappings" \
+        "2|Add a mapping" \
+        "3|Remove a mapping" \
+        "0|Back" || return 0
+    case "$choice" in
+        1) "$BH_MANAGER_BIN" mapping list "$unit"; pause_menu || true ;;
+        2)
+            read -r -p "New mapping (example: 8203=127.0.0.1:8093): " mapping ||
+                return 0
+            confirm "Add mapping $mapping and restart the service?" &&
+                "$BH_MANAGER_BIN" mapping add "$unit" "$mapping"
+            pause_menu || true
+            ;;
+        3)
+            "$BH_MANAGER_BIN" mapping list "$unit"
+            read -r -p "Public port to remove: " public_port || return 0
+            confirm "Remove public port $public_port and restart the service?" &&
+                "$BH_MANAGER_BIN" mapping remove "$unit" "$public_port"
+            pause_menu || true
+            ;;
+        0) return 0 ;;
+        *) warn "Invalid selection."; pause_menu || true ;;
+    esac
+}
+
+tunnel_management() {
+    local unit choice=""
+    unit="$(select_unit "Select a tunnel to manage")" || {
+        pause_menu || true
+        return 0
+    }
+    while true; do
+        clear_screen
+        printf '%sTunnel management: %s%s\n\n' "$BH_CYAN" "$unit" "$BH_RESET"
+        menu_select choice "Selection" \
+            "1|Show status" \
+            "2|Show live logs" \
+            "3|Restart" \
+            "4|Start, stop, and boot settings" \
+            "5|Manage port mappings" \
+            "6|Show config with token redacted" \
+            "7|Move tunnel to a recoverable archive" \
+            "0|Back" || return 0
+        case "$choice" in
+            1) "$BH_MANAGER_BIN" status "$unit"; pause_menu ;;
+            2)
+                printf 'Press Ctrl+C to stop live logs.\n'
+                follow_service_logs "$unit"
+                pause_menu
+                ;;
+            3)
+                confirm "Restart service $unit?" &&
+                    "$BH_MANAGER_BIN" restart "$unit"
+                pause_menu
+                ;;
+            4) service_controls_for_unit "$unit" ;;
+            5) mapping_menu "$unit" ;;
+            6)
+                show_redacted_config "$unit"
+                pause_menu
+                ;;
+            7)
+                if confirm "Stop this tunnel and move it to a recoverable archive?"; then
+                    "$BH_MANAGER_BIN" retire "$unit" --yes
+                    pause_menu
+                    return 0
+                fi
+                ;;
+            0) return 0 ;;
+            *) warn "Invalid selection."; pause_menu ;;
+        esac
+    done
+}
+
+service_controls_for_unit() {
+    local unit="$1"
+    local action=""
+    clear_screen
+    printf '%sService controls: %s%s\n\n' "$BH_CYAN" "$unit" "$BH_RESET"
+    menu_select action "Selection" \
+        "1|Start" \
+        "2|Stop" \
+        "3|Restart" \
+        "4|Enable at boot" \
+        "5|Disable at boot" \
+        "0|Back" || return 0
+    case "$action" in
+        1)
+            systemctl start "$unit"
+            systemctl is-active "$unit"
+            pause_menu || true
+            ;;
+        2)
+            confirm "Stopping $unit will interrupt its tunnel. Continue?" || return 0
+            systemctl stop "$unit"
+            systemctl is-active "$unit" || true
+            pause_menu || true
+            ;;
+        3)
+            systemctl restart "$unit"
+            systemctl is-active "$unit"
+            pause_menu || true
+            ;;
+        4)
+            systemctl enable "$unit"
+            systemctl is-enabled "$unit"
+            pause_menu || true
+            ;;
+        5)
+            confirm "Disable automatic startup for $unit after reboot?" || return 0
+            systemctl disable "$unit"
+            systemctl is-enabled "$unit" || true
+            pause_menu || true
+            ;;
+        0) return 0 ;;
+        *) warn "Invalid selection."; pause_menu || true ;;
+    esac
+}
+
+show_redacted_config() {
+    local unit="$1"
+    local config
+    config="$(unit_config_path "$unit" 2>/dev/null || true)"
+    [[ -n "$config" && -r "$config" ]] || {
+        warn "The service config was not found."
+        return 0
+    }
+    sed -E \
+        's/^([[:space:]]*[A-Za-z0-9_]*token[[:space:]]*=[[:space:]]*).*/\1"***REDACTED***"/' \
+        "$config"
+}
+
+health_menu() {
+    clear_screen
+    local choice=""
+    printf '%sHealth check and auto-repair%s\n\n' "$BH_CYAN" "$BH_RESET"
+    menu_select choice "Selection" \
+        "1|Check only" \
+        "2|Check and auto-repair" \
+        "0|Back" || return 0
+    case "$choice" in
+        1) "$BH_MANAGER_BIN" health; pause_menu || true ;;
+        2) "$BH_MANAGER_BIN" health --repair; pause_menu || true ;;
+        0) return 0 ;;
+        *) warn "Invalid selection."; pause_menu || true ;;
+    esac
+}
+
+cron_menu() {
+    clear_screen
+    local choice="" interval=""
+    printf '%sHealth-check cron%s\n\n' "$BH_CYAN" "$BH_RESET"
+    menu_select choice "Selection" \
+        "1|Show health cron status" \
+        "2|Enable every 5 minutes" \
+        "3|Set a custom interval" \
+        "4|Remove health cron" \
+        "0|Back" || return 0
+    case "$choice" in
+        1) "$BH_MANAGER_BIN" cron status; pause_menu || true ;;
+        2) "$BH_MANAGER_BIN" cron install --interval 5; pause_menu || true ;;
+        3)
+            read -r -p "Check interval (1 to 59 minutes): " interval ||
+                return 0
+            "$BH_MANAGER_BIN" cron install --interval "$interval"
+            pause_menu || true
+            ;;
+        4)
+            confirm "Remove the health-check cron job?" &&
+                "$BH_MANAGER_BIN" cron remove
+            pause_menu || true
+            ;;
+        0) return 0 ;;
+        *) warn "Invalid selection."; pause_menu || true ;;
+    esac
+}
+
+select_backup_archive() {
+    local result_variable="$1"
+    local -a archives=() choices=()
+    local archive choice="" index
+    if [[ -d "$BH_BACKUP_DIR" ]]; then
+        mapfile -t archives < <(
+            find "$BH_BACKUP_DIR" -maxdepth 1 -type f \
+                -name 'backhaul-backup-*.tar.gz' -printf '%T@ %p\n' |
+                sort -rn | cut -d' ' -f2-
+        )
+    fi
+    ((${#archives[@]} > 0)) || {
+        warn "No backup archive is available."
+        return 1
+    }
+    for index in "${!archives[@]}"; do
+        archive="${archives[$index]}"
+        choices+=("$((index + 1))|$(basename "$archive")")
+    done
+    choices+=("0|Back")
+    menu_select choice "Select a backup" "${choices[@]}" || return 1
+    [[ "$choice" != "0" ]] || return 1
+    [[ "$choice" =~ ^[0-9]+$ ]] || return 1
+    ((choice >= 1 && choice <= ${#archives[@]})) || return 1
+    printf -v "$result_variable" '%s' "${archives[$((choice - 1))]}"
+}
+
+backup_menu() {
+    clear_screen
+    local choice="" archive=""
+    printf '%sBackups and restore%s\n\n' "$BH_CYAN" "$BH_RESET"
+    menu_select choice "Selection" \
+        "1|Create a new backup" \
+        "2|List backups" \
+        "3|Restore a backup" \
+        "0|Back" || return 0
+    case "$choice" in
+        1) "$BH_MANAGER_BIN" backup create; pause_menu || true ;;
+        2) "$BH_MANAGER_BIN" backup list; pause_menu || true ;;
+        3)
+            select_backup_archive archive || return 0
+            printf 'Restore replaces matching configs and service files.\n'
+            printf 'A safety backup is created automatically before any change.\n'
+            if confirm "Restore $(basename "$archive")?"; then
+                "$BH_MANAGER_BIN" backup restore "$archive" --yes
+            fi
+            pause_menu || true
+            ;;
+        0) return 0 ;;
+        *) warn "Invalid selection."; pause_menu || true ;;
+    esac
+}
+
+add_server_interactive() {
+    local name="" bind="" public_host="" transport="wsmux" mapping=""
+    local -a args=()
+    read -r -p "Short country name (example: de): " name || return 0
+    read -r -p "Control bind address (example: 0.0.0.0:9200): " bind ||
+        return 0
+    read -r -p "Public IP or domain of the Iran server: " public_host ||
+        return 0
+    read -r -p "Transport [wsmux]: " transport || return 0
+    transport="${transport:-wsmux}"
+    while true; do
+        read -r -p "Port mapping (example: 8200=127.0.0.1:8090; press Enter to finish): " mapping ||
+            return 0
+        [[ -n "$mapping" ]] || break
+        args+=(--map "$mapping")
+    done
+    ((${#args[@]} > 0)) || {
+        warn "No port mapping was entered."
+        return 0
+    }
+    confirm "Create a server tunnel named $name?" || return 0
+    "$BH_MANAGER_BIN" server add \
+        --name "$name" \
+        --bind "$bind" \
+        --public-host "$public_host" \
+        --transport "$transport" \
+        "${args[@]}"
+}
+
+add_client_interactive() {
+    local name="" remote="" transport="wsmux" token=""
+    read -r -p "Short country name (must match the server name): " name ||
+        return 0
+    read -r -p "Iran control address (HOST:PORT): " remote || return 0
+    read -r -p "Transport [wsmux]: " transport || return 0
+    transport="${transport:-wsmux}"
+    read -r -s -p "Server token: " token || return 0
+    printf '\n'
+    confirm "Create a client tunnel named $name?" || return 0
+    "$BH_MANAGER_BIN" client add \
+        --name "$name" \
+        --remote "$remote" \
+        --transport "$transport" \
+        --token "$token"
+}
+
+configure_tunnel() {
+    clear_screen
+    local choice=""
+    printf '%sCreate a new tunnel%s\n\n' "$BH_CYAN" "$BH_RESET"
+    menu_select choice "Selection" \
+        "1|${BH_GREEN}Configure the Iran entry server (Server)${BH_RESET}" \
+        "2|${BH_CYAN}Configure a foreign exit server (Client)${BH_RESET}" \
+        "0|Back" || return 0
+    case "$choice" in
+        1) add_server_interactive; pause_menu || true ;;
+        2) add_client_interactive; pause_menu || true ;;
+        0) return 0 ;;
+        *) warn "Invalid selection."; pause_menu || true ;;
+    esac
+}
+
+network_tools() {
+    clear_screen
+    local choice=""
+    printf '%sNetwork diagnostics%s\n\n' "$BH_CYAN" "$BH_RESET"
+    menu_select choice "Selection" \
+        "1|Run full Backhaul diagnostics" \
+        "2|Show listening ports" \
+        "3|Show active Backhaul connections" \
+        "4|Show important network settings (read-only)" \
+        "0|Back" || return 0
+    case "$choice" in
+        1) "$BH_MANAGER_BIN" doctor ;;
+        2)
+            if ! command -v ss >/dev/null 2>&1; then
+                warn "The ss command is not installed."
+                pause_menu || true
+                return 0
+            fi
+            local listening
+            listening="$(ss -H -lntp 2>/dev/null | grep -F 'backhaul' || true)"
+            if [[ -n "$listening" ]]; then
+                printf '%s\n' "$listening"
+            else
+                printf 'No local Backhaul listening port was found.\n'
+                printf 'This is normal on a Client that connects to the Iran server.\n'
+            fi
+            ;;
+        3)
+            if ! command -v ss >/dev/null 2>&1; then
+                warn "The ss command is not installed."
+                pause_menu || true
+                return 0
+            fi
+            local connections
+            connections="$(ss -H -ntp 2>/dev/null | grep -F 'backhaul' || true)"
+            if [[ -n "$connections" ]]; then
+                printf '%s\n' "$connections"
+            else
+                printf 'No active Backhaul TCP connection was found.\n'
+            fi
+            ;;
+        4)
+            printf 'qdisc: '
+            sysctl -n net.core.default_qdisc 2>/dev/null || printf 'unknown\n'
+            printf 'congestion_control: '
+            sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || printf 'unknown\n'
+            printf 'rmem_max: '
+            sysctl -n net.core.rmem_max 2>/dev/null || printf 'unknown\n'
+            printf 'wmem_max: '
+            sysctl -n net.core.wmem_max 2>/dev/null || printf 'unknown\n'
+            printf '\nNo settings were changed by this option.\n'
+            ;;
+        0) return 0 ;;
+        *) warn "Invalid selection." ;;
+    esac
+    pause_menu || true
+}
+
+core_menu() {
+    clear_screen
+    local choice=""
+    printf '%sBackhaul core%s\n\n' "$BH_CYAN" "$BH_RESET"
+    menu_select choice "Selection" \
+        "1|Show core version and hash" \
+        "2|Install or update the official Backhaul core" \
+        "0|Back" || return 0
+    case "$choice" in
+        1)
+            if [[ -x "$BH_BIN" ]]; then
+                "$BH_BIN" --version 2>/dev/null || true
+                sha256sum "$BH_BIN"
+            else
+                warn "The Backhaul core is not installed."
+            fi
+            ;;
+        2) update_backhaul ;;
+        0) return 0 ;;
+        *) warn "Invalid selection." ;;
+    esac
+    pause_menu || true
+}
+
+update_backhaul() {
+    local latest=""
+    local version=""
+    if latest="$(latest_backhaul_version)"; then
+        version="$latest"
+        printf 'Latest official Backhaul release: %s\n' "$latest"
+    else
+        version="$BH_VERSION_DEFAULT"
+        warn "Could not query GitHub; using the tested fallback $BH_VERSION_DEFAULT."
+    fi
+    read -r -p "Backhaul version [$version] (or type latest): " version ||
+        return 0
+    version="${version:-${latest:-$BH_VERSION_DEFAULT}}"
+    printf 'This operation verifies the release digest, backs up the current binary,\n'
+    printf 'restarts active Backhaul services, and rolls back if they do not remain healthy.\n'
+    confirm "Update the Backhaul core to $version?" || return 0
+    if [[ "$version" == "latest" ]]; then
+        "$BH_MANAGER_BIN" binary install --latest
+    else
+        "$BH_MANAGER_BIN" binary install --version "$version"
+    fi
+}
+
+update_manager() {
+    local temp_dir installer
+    confirm "Update Manager files from GitHub?" || return 0
+    if ! command -v curl >/dev/null 2>&1 &&
+       ! command -v wget >/dev/null 2>&1; then
+        warn "curl or wget is required to update the Manager."
+        return 1
+    fi
+    temp_dir="$(mktemp -d)"
+    installer="$temp_dir/install.sh"
+    if ! download_to "$BH_RAW_BASE/install.sh" "$installer"; then
+        rm -rf -- "$temp_dir"
+        warn "Failed to download the Manager installer."
+        return 1
+    fi
+    chmod 755 "$installer"
+    if ! BH_RAW_BASE="$BH_RAW_BASE" "$installer" --skip-binary; then
+        rm -rf -- "$temp_dir"
+        warn "The Manager update failed. Existing tunnel configs were not changed."
+        return 1
+    fi
+    rm -rf -- "$temp_dir"
+    success "Manager updated. Configs and services were left unchanged."
+}
+
+main_menu() {
+    require_root
+    trap handle_exit EXIT
+    trap 'exit 129' HUP
+    trap 'exit 143' TERM
+    terminal_enter
+
+    while true; do
+        header
+        local choice=""
+        menu_select choice "Select an option" \
+            "1|${BH_GREEN}Create a new tunnel (IPv4 / IPv6)${BH_RESET}" \
+            "2|${BH_YELLOW}Manage tunnels${BH_RESET}" \
+            "3|${BH_CYAN}Show all tunnel statuses${BH_RESET}" \
+            "4|Health check and auto-repair" \
+            "5|Manage health-check cron" \
+            "6|Backups and restore" \
+            "7|Network diagnostics" \
+            "8|Install or update the Backhaul core" \
+            "9|Update Manager from GitHub" \
+            "0|Exit" || return 0
+        case "$choice" in
+            1) configure_tunnel ;;
+            2) tunnel_management ;;
+            3) show_dashboard; pause_menu ;;
+            4) health_menu ;;
+            5) cron_menu ;;
+            6) backup_menu ;;
+            7) network_tools ;;
+            8) core_menu ;;
+            9) update_manager; pause_menu ;;
+            0) return 0 ;;
+            *) warn "Invalid selection."; pause_menu ;;
+        esac
+    done
+}
+
+main_menu "$@"

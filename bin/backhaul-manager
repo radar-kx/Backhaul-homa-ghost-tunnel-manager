@@ -1,0 +1,1686 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# Main tunnel manager. Each tunnel has an independent config and systemd unit.
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -r "${BH_PROJECT_DIR:-/opt/backhaul-tunnel-manager}/lib/common.sh" ]]; then
+    # Installed server path.
+    # shellcheck source=/opt/backhaul-tunnel-manager/lib/common.sh
+    # shellcheck disable=SC1091
+    source "${BH_PROJECT_DIR:-/opt/backhaul-tunnel-manager}/lib/common.sh"
+else
+    # Direct execution from a source tree.
+    # shellcheck source=../lib/common.sh
+    # shellcheck disable=SC1091
+    source "$SCRIPT_DIR/../lib/common.sh"
+fi
+
+usage() {
+    cat <<'EOF'
+Backhaul Homa Ghost Tunnel Manager
+
+Usage:
+  backhaul-manager menu
+  backhaul-manager server add [options]
+  backhaul-manager client add [options]
+  backhaul-manager binary install [--latest | --version VERSION | --file PATH] [--sha256 HASH]
+                                  [--allow-unverified-download]
+  backhaul-manager list
+  backhaul-manager status [NAME|UNIT]
+  backhaul-manager health [--repair] [--enable-disabled] [--quiet]
+  backhaul-manager cron install [--interval MINUTES]
+  backhaul-manager cron status
+  backhaul-manager cron remove
+  backhaul-manager backup create
+  backhaul-manager backup list
+  backhaul-manager backup restore ARCHIVE --yes
+  backhaul-manager mapping list UNIT
+  backhaul-manager mapping add UNIT PUBLIC_PORT=REMOTE_HOST:REMOTE_PORT
+  backhaul-manager mapping remove UNIT PUBLIC_PORT
+  backhaul-manager retire UNIT --yes
+  backhaul-manager doctor
+  backhaul-manager logs UNIT
+  backhaul-manager restart UNIT
+  backhaul-manager logs ROLE NAME       (legacy syntax)
+  backhaul-manager restart ROLE NAME    (legacy syntax)
+  backhaul-manager remove ROLE NAME
+  backhaul-manager version
+
+Server options:
+  --name NAME
+  --bind IP:PORT
+  --public-host HOST
+  --transport tcp|tcpmux|ws|wss|wsmux|wssmux
+  --token TOKEN
+  --map PUBLIC_PORT=REMOTE_HOST:REMOTE_PORT   (repeatable)
+  --tls-cert /ABSOLUTE/PATH   (required for wss/wssmux)
+  --tls-key /ABSOLUTE/PATH    (required for wss/wssmux)
+  --open-firewall
+  --replace                    (explicitly replace an existing tunnel)
+
+Client options:
+  --name NAME
+  --remote HOST:PORT
+  --transport tcp|tcpmux|ws|wss|wsmux|wssmux
+  --token TOKEN
+  --replace                    (explicitly replace an existing tunnel)
+EOF
+}
+
+unit_name() {
+    local role="$1"
+    local name="$2"
+    printf 'backhaul-%s-%s.service\n' "$name" "$role"
+}
+
+config_path() {
+    local role="$1"
+    local name="$2"
+    printf '%s/%s-%s.toml\n' "$BH_CONFIG_DIR" "$name" "$role"
+}
+
+render_unit() {
+    local role="$1"
+    local name="$2"
+    local config="$3"
+
+    cat <<EOF
+[Unit]
+Description=Backhaul ${role^} - ${name}
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=$BH_BIN -c $config
+Restart=always
+RestartSec=3
+LimitNOFILE=1048576
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+deploy_tunnel() {
+    local role="$1"
+    local name="$2"
+    local candidate_config="$3"
+    local unit config unit_file transaction_dir
+    local old_config=0 old_unit=0
+    local old_startup="disabled" old_current="inactive"
+    local rollback_failed=0 file_restore_failed=0
+
+    unit="$(unit_name "$role" "$name")"
+    config="$(config_path "$role" "$name")"
+    unit_file="$BH_SYSTEMD_DIR/$unit"
+    transaction_dir="$(mktemp -d "$BH_STATE_DIR/deploy.XXXXXX")"
+
+    if [[ -e "$config" ]]; then
+        cp -a -- "$config" "$transaction_dir/config.previous"
+        old_config=1
+    fi
+    if [[ -e "$unit_file" ]]; then
+        cp -a -- "$unit_file" "$transaction_dir/unit.previous"
+        old_unit=1
+    fi
+
+    if [[ "${BH_NO_SYSTEMD:-0}" != "1" ]] &&
+       command -v systemctl >/dev/null 2>&1; then
+        old_startup="$(systemctl_state is-enabled "$unit")"
+        old_current="$(systemctl_state is-active "$unit")"
+    fi
+
+    if ! atomic_install_file "$candidate_config" "$config" 600 0 ||
+       ! render_unit "$role" "$name" "$config" |
+           atomic_install_stdin "$unit_file" 644; then
+        if ((old_config == 1)); then
+            cp -a -- "$transaction_dir/config.previous" "$config" ||
+                file_restore_failed=1
+        else
+            rm -f -- "$config" || file_restore_failed=1
+        fi
+        if ((old_unit == 1)); then
+            cp -a -- "$transaction_dir/unit.previous" "$unit_file" ||
+                file_restore_failed=1
+        else
+            rm -f -- "$unit_file" || file_restore_failed=1
+        fi
+        rm -f -- "$candidate_config"
+        rm -rf -- "$transaction_dir"
+        ((file_restore_failed == 0)) ||
+            die "Tunnel file installation failed and file rollback was incomplete."
+        die "Tunnel files could not be installed. The previous files were restored."
+    fi
+    rm -f -- "$candidate_config"
+
+    if [[ "${BH_NO_SYSTEMD:-0}" == "1" ]]; then
+        rm -rf -- "$transaction_dir"
+        info "Test mode: systemd was not invoked ($unit)."
+        success "Service is active: $unit"
+        return 0
+    fi
+
+    need_cmd systemctl
+    if systemctl daemon-reload &&
+       systemctl enable "$unit" &&
+       systemctl restart "$unit" &&
+       wait_for_unit_stable "$unit"; then
+        rm -rf -- "$transaction_dir"
+        success "Service is active: $unit"
+        return 0
+    fi
+
+    warn "The new tunnel failed to start. Restoring the previous state."
+    if ((old_unit == 0)); then
+        systemctl disable --now "$unit" >/dev/null 2>&1 || true
+    fi
+    if ((old_config == 1)); then
+        cp -a -- "$transaction_dir/config.previous" "$config" ||
+            rollback_failed=1
+    else
+        rm -f -- "$config" || rollback_failed=1
+    fi
+    if ((old_unit == 1)); then
+        cp -a -- "$transaction_dir/unit.previous" "$unit_file" ||
+            rollback_failed=1
+    else
+        rm -f -- "$unit_file" || rollback_failed=1
+    fi
+
+    systemctl daemon-reload || rollback_failed=1
+    if ((old_unit == 1)); then
+        if unit_startup_is_enabled "$old_startup"; then
+            systemctl enable "$unit" >/dev/null 2>&1 ||
+                rollback_failed=1
+        else
+            systemctl disable "$unit" >/dev/null 2>&1 ||
+                rollback_failed=1
+        fi
+        if unit_runtime_is_active "$old_current"; then
+            systemctl restart "$unit" >/dev/null 2>&1 ||
+                rollback_failed=1
+            wait_for_unit_stable "$unit" ||
+                rollback_failed=1
+        else
+            systemctl stop "$unit" >/dev/null 2>&1 ||
+                rollback_failed=1
+        fi
+    fi
+    rm -rf -- "$transaction_dir"
+
+    ((rollback_failed == 0)) ||
+        die "Tunnel deployment failed and rollback was incomplete. Inspect $unit immediately."
+    die "Tunnel deployment failed. The previous config and service state were restored."
+}
+
+server_add() {
+    local name=""
+    local bind=""
+    local public_host=""
+    local transport="wsmux"
+    local token=""
+    local tls_cert=""
+    local tls_key=""
+    local open_firewall=0
+    local replace=0
+    local -a mappings=()
+
+    while (($#)); do
+        case "$1" in
+            --name)
+                require_option_value "$1" "$#" "${2:-}"
+                name="$2"; shift 2
+                ;;
+            --bind)
+                require_option_value "$1" "$#" "${2:-}"
+                bind="$2"; shift 2
+                ;;
+            --public-host)
+                require_option_value "$1" "$#" "${2:-}"
+                public_host="$2"; shift 2
+                ;;
+            --transport)
+                require_option_value "$1" "$#" "${2:-}"
+                transport="$2"; shift 2
+                ;;
+            --token)
+                require_option_value "$1" "$#" "${2:-}"
+                token="$2"; shift 2
+                ;;
+            --map)
+                require_option_value "$1" "$#" "${2:-}"
+                mappings+=("$2"); shift 2
+                ;;
+            --tls-cert)
+                require_option_value "$1" "$#" "${2:-}"
+                tls_cert="$2"; shift 2
+                ;;
+            --tls-key)
+                require_option_value "$1" "$#" "${2:-}"
+                tls_key="$2"; shift 2
+                ;;
+            --open-firewall) open_firewall=1; shift ;;
+            --replace) replace=1; shift ;;
+            -h|--help) usage; exit 0 ;;
+            *) die "Unknown server option: $1" ;;
+        esac
+    done
+
+    [[ -n "$name" ]] || die "--name is required."
+    [[ -n "$bind" ]] || die "--bind is required."
+    ((${#mappings[@]} > 0)) || die "At least one --map option is required."
+    validate_name "$name"
+    validate_bind "$bind"
+    validate_transport "$transport"
+    [[ -z "$public_host" ]] || validate_host "$public_host"
+
+    if [[ "$transport" == "wss" || "$transport" == "wssmux" ]]; then
+        [[ -n "$tls_cert" && -n "$tls_key" ]] ||
+            die "--tls-cert and --tls-key are required for $transport."
+        validate_absolute_path "$tls_cert"
+        validate_absolute_path "$tls_key"
+        [[ -r "$tls_cert" ]] || die "The TLS certificate is not readable: $tls_cert"
+        [[ -r "$tls_key" ]] || die "The TLS private key is not readable: $tls_key"
+    elif [[ -n "$tls_cert" || -n "$tls_key" ]]; then
+        die "--tls-cert and --tls-key may be used only with wss or wssmux."
+    fi
+
+    if [[ -z "$token" ]]; then
+        token="$(generate_token)"
+    fi
+    validate_token "$token"
+
+    local mapping public_port
+    local control_port="${bind##*:}"
+    local -A seen_public_ports=()
+    for mapping in "${mappings[@]}"; do
+        validate_mapping "$mapping"
+        public_port="${mapping%%=*}"
+        [[ -z "${seen_public_ports[$public_port]+present}" ]] ||
+            die "Public port $public_port was entered more than once."
+        [[ "$public_port" != "$control_port" ]] ||
+            die "Public port $public_port conflicts with the tunnel control port."
+        seen_public_ports["$public_port"]=1
+    done
+
+    require_root
+    [[ -x "$BH_BIN" ]] || die "Install the binary first: backhaul-manager binary install"
+    install -d -m 700 "$BH_CONFIG_DIR" "$BH_STATE_DIR"
+
+    local config
+    config="$(config_path server "$name")"
+    if ((replace == 0)) &&
+       [[ -e "$config" || -e "$BH_SYSTEMD_DIR/$(unit_name server "$name")" ]]; then
+        die "Tunnel server/$name already exists. Use --replace to replace it explicitly."
+    fi
+    local candidate_config
+    candidate_config="$(mktemp "$BH_STATE_DIR/.server-config.XXXXXX")"
+    {
+        cat <<EOF
+[server]
+bind_addr = "$bind"
+transport = "$transport"
+token = "$token"
+keepalive_period = 30
+nodelay = true
+heartbeat = 40
+channel_size = 2048
+mux_con = 8
+mux_version = 1
+mux_framesize = 32768
+mux_recievebuffer = 4194304
+mux_streambuffer = 65536
+sniffer = false
+web_port = 0
+log_level = "info"
+EOF
+        if [[ "$transport" == "wss" || "$transport" == "wssmux" ]]; then
+            printf 'tls_cert = "%s"\n' "$tls_cert"
+            printf 'tls_key = "%s"\n' "$tls_key"
+        fi
+        printf '\nports = [\n'
+        for mapping in "${mappings[@]}"; do
+            printf '    "%s",\n' "$mapping"
+        done
+        printf ']\n'
+    } >"$candidate_config"
+
+    deploy_tunnel server "$name" "$candidate_config"
+    if ((open_firewall == 1)); then
+        open_ufw_port "${control_port}/tcp"
+        for mapping in "${mappings[@]}"; do
+            open_ufw_port "${mapping%%=*}/tcp"
+        done
+    fi
+
+    printf '\n=== SERVER READY ===\n'
+    printf 'Name: %s\nControl: %s\nTransport: %s\n' "$name" "$bind" "$transport"
+    printf 'Mappings:\n'
+    printf '  %s\n' "${mappings[@]}"
+
+    if [[ -n "$public_host" ]]; then
+        printf '\n=== CLIENT INSTALL COMMAND ===\n'
+        printf 'sudo bash <(curl -fsSL --ipv4 %q/install.sh) client add ' "$BH_RAW_BASE"
+        printf '%q ' --name "$name" --remote "${public_host}:${control_port}" \
+            --transport "$transport" --token "$token"
+        printf '\n'
+        warn "The client command contains a token. Do not publish it."
+    else
+        printf '\nToken: %s\n' "$token"
+        warn "Use the token only on the matching client."
+    fi
+}
+
+client_add() {
+    local name=""
+    local remote=""
+    local transport="wsmux"
+    local token=""
+    local replace=0
+
+    while (($#)); do
+        case "$1" in
+            --name)
+                require_option_value "$1" "$#" "${2:-}"
+                name="$2"; shift 2
+                ;;
+            --remote)
+                require_option_value "$1" "$#" "${2:-}"
+                remote="$2"; shift 2
+                ;;
+            --transport)
+                require_option_value "$1" "$#" "${2:-}"
+                transport="$2"; shift 2
+                ;;
+            --token)
+                require_option_value "$1" "$#" "${2:-}"
+                token="$2"; shift 2
+                ;;
+            --replace) replace=1; shift ;;
+            -h|--help) usage; exit 0 ;;
+            *) die "Unknown client option: $1" ;;
+        esac
+    done
+
+    [[ -n "$name" ]] || die "--name is required."
+    [[ -n "$remote" ]] || die "--remote is required."
+    [[ -n "$token" ]] || die "--token is required."
+    validate_name "$name"
+    validate_endpoint "$remote"
+    validate_transport "$transport"
+    validate_token "$token"
+
+    require_root
+    [[ -x "$BH_BIN" ]] || die "Install the binary first: backhaul-manager binary install"
+    install -d -m 700 "$BH_CONFIG_DIR" "$BH_STATE_DIR"
+
+    local config
+    config="$(config_path client "$name")"
+    if ((replace == 0)) &&
+       [[ -e "$config" || -e "$BH_SYSTEMD_DIR/$(unit_name client "$name")" ]]; then
+        die "Tunnel client/$name already exists. Use --replace to replace it explicitly."
+    fi
+    local candidate_config
+    candidate_config="$(mktemp "$BH_STATE_DIR/.client-config.XXXXXX")"
+    cat >"$candidate_config" <<EOF
+[client]
+remote_addr = "$remote"
+transport = "$transport"
+token = "$token"
+connection_pool = 8
+aggressive_pool = false
+keepalive_period = 30
+dial_timeout = 10
+nodelay = true
+retry_interval = 3
+mux_version = 1
+mux_framesize = 32768
+mux_recievebuffer = 4194304
+mux_streambuffer = 65536
+sniffer = false
+web_port = 0
+log_level = "info"
+EOF
+
+    deploy_tunnel client "$name" "$candidate_config"
+    printf '\n=== CLIENT READY ===\n'
+    printf 'Name: %s\nRemote: %s\nTransport: %s\n' "$name" "$remote" "$transport"
+}
+
+binary_install() {
+    local version="$BH_VERSION_DEFAULT"
+    local file=""
+    local sha256=""
+    local use_latest=0
+    local allow_unverified=0
+
+    while (($#)); do
+        case "$1" in
+            --version)
+                require_option_value "$1" "$#" "${2:-}"
+                version="$2"; shift 2
+                ;;
+            --latest)
+                use_latest=1; shift
+                ;;
+            --file)
+                require_option_value "$1" "$#" "${2:-}"
+                file="$2"; shift 2
+                ;;
+            --sha256)
+                require_option_value "$1" "$#" "${2:-}"
+                sha256="$2"; shift 2
+                ;;
+            --allow-unverified-download)
+                allow_unverified=1; shift
+                ;;
+            *) die "Unknown binary option: $1" ;;
+        esac
+    done
+
+    if ((use_latest == 1)); then
+        [[ -z "$file" ]] || die "--latest cannot be combined with --file."
+        version="$(latest_backhaul_version)" ||
+            die "Unable to determine the latest official Backhaul release."
+    fi
+    [[ "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] ||
+        die "The version must use a format such as v0.7.2."
+
+    if ((allow_unverified == 1)); then
+        BH_REQUIRE_RELEASE_DIGEST=0 install_backhaul_binary "$version" "$file" "$sha256"
+    else
+        install_backhaul_binary "$version" "$file" "$sha256"
+    fi
+}
+
+resolve_units() {
+    local first="${1:-}"
+    local second="${2:-}"
+    local wanted=""
+    local unit config role name
+
+    if [[ "$first" == "server" || "$first" == "client" ]]; then
+        [[ -n "$second" ]] || die "No tunnel name was provided."
+        validate_name "$second"
+        wanted="$(unit_name "$first" "$second")"
+    else
+        wanted="$first"
+    fi
+
+    if [[ -n "$wanted" && "$wanted" != *.service ]]; then
+        local exact_matches=0
+        while IFS= read -r unit; do
+            [[ -n "$unit" ]] || continue
+            config="$(unit_config_path "$unit" 2>/dev/null || true)"
+            role="$(unit_role_from_config "$config")"
+            name="$(unit_short_name "$unit" "$role")"
+            if [[ "$name" == "$wanted" || "${unit%.service}" == "$wanted" ||
+                  "${unit#backhaul-}" == "$wanted.service" ]]; then
+                printf '%s\n' "$unit"
+                exact_matches=$((exact_matches + 1))
+            fi
+        done < <(discover_backhaul_units)
+        ((exact_matches > 0)) || return 1
+        return 0
+    fi
+
+    if [[ -n "$wanted" ]]; then
+        validate_unit_name "$wanted"
+        unit_is_managed "$wanted" || return 1
+        printf '%s\n' "$wanted"
+        return 0
+    fi
+
+    discover_backhaul_units
+}
+
+list_tunnels() {
+    printf '%-9s %-18s %-10s %-10s %s\n' \
+        "ROLE" "NAME" "STARTUP" "CURRENT" "UNIT"
+
+    local unit config role name startup current found=0
+    while IFS= read -r unit; do
+        [[ -n "$unit" ]] || continue
+        found=1
+        config="$(unit_config_path "$unit" 2>/dev/null || true)"
+        role="$(unit_role_from_config "$config")"
+        name="$(unit_short_name "$unit" "$role")"
+        startup="unknown"
+        current="unknown"
+        if [[ "${BH_NO_SYSTEMD:-0}" != "1" ]] &&
+           command -v systemctl >/dev/null 2>&1; then
+            startup="$(systemctl_state is-enabled "$unit")"
+            current="$(systemctl_state is-active "$unit")"
+        fi
+        printf '%-9s %-18s %-10s %-10s %s\n' \
+            "$role" "$name" "${startup:-unknown}" "${current:-unknown}" "$unit"
+    done < <(discover_backhaul_units)
+
+    if ((found == 0)); then
+        warn "No Backhaul service was found."
+    fi
+}
+
+status_tunnels() {
+    local wanted="${1:-}"
+    local found=0
+    local unit config role name startup current
+
+    while IFS= read -r unit; do
+        [[ -n "$unit" ]] || continue
+        found=1
+        config="$(unit_config_path "$unit" 2>/dev/null || true)"
+        role="$(unit_role_from_config "$config")"
+        name="$(unit_short_name "$unit" "$role")"
+        printf '\n=== %s / %s ===\n' "$name" "$role"
+        printf 'Unit: %s\nConfig: %s\n' "$unit" "${config:-unknown}"
+
+        if [[ "${BH_NO_SYSTEMD:-0}" == "1" ]]; then
+            printf 'Startup: test-mode\nCurrent: test-mode\n'
+        else
+            startup="$(systemctl_state is-enabled "$unit")"
+            current="$(systemctl_state is-active "$unit")"
+            printf 'Startup: %s\nCurrent: %s\n' \
+                "${startup:-unknown}" "${current:-unknown}"
+            systemctl --no-pager --full status "$unit" || true
+        fi
+    done < <(resolve_units "$wanted" 2>/dev/null || true)
+
+    ((found == 1)) || die "No tunnel was found${wanted:+: $wanted}"
+}
+
+health_check() {
+    local repair=0
+    local enable_disabled=0
+    local quiet=0
+    while (($#)); do
+        case "$1" in
+            --repair) repair=1 ;;
+            --enable-disabled) enable_disabled=1 ;;
+            --quiet) quiet=1 ;;
+            *) die "Invalid health option: $1" ;;
+        esac
+        shift
+    done
+
+    require_root
+    [[ "${BH_NO_SYSTEMD:-0}" != "1" ]] || {
+        ((quiet == 1)) || printf 'Health check: test-mode\n'
+        return 0
+    }
+    need_cmd systemctl
+
+    local unit startup current final_current
+    local total=0 healthy=0 repaired=0 skipped=0 failed=0
+    while IFS= read -r unit; do
+        [[ -n "$unit" ]] || continue
+        total=$((total + 1))
+        startup="$(systemctl_state is-enabled "$unit")"
+        current="$(systemctl_state is-active "$unit")"
+
+        if ! unit_startup_is_enabled "$startup" &&
+           [[ "$repair" == "1" && "$enable_disabled" == "1" ]]; then
+            if systemctl enable "$unit" >/dev/null 2>&1; then
+                repaired=$((repaired + 1))
+                startup="$(systemctl_state is-enabled "$unit")"
+                ((quiet == 1)) || warn "$unit was enabled for automatic startup."
+            fi
+        fi
+
+        if ! unit_startup_is_enabled "$startup" &&
+           ! unit_runtime_is_active "$current"; then
+            skipped=$((skipped + 1))
+            if ((quiet == 0)); then
+                printf '[SKIPPED] %-33s startup=%s current=%s\n' \
+                    "$unit" "${startup:-unknown}" "${current:-unknown}"
+            fi
+            continue
+        fi
+
+        if ! unit_runtime_is_active "$current" && [[ "$repair" == "1" ]]; then
+            systemctl reset-failed "$unit" >/dev/null 2>&1 || true
+            if systemctl restart "$unit" >/dev/null 2>&1 &&
+               wait_for_unit_stable "$unit"; then
+                repaired=$((repaired + 1))
+            fi
+            final_current="$(systemctl_state is-active "$unit")"
+        else
+            final_current="$current"
+        fi
+
+        if unit_runtime_is_active "$final_current" &&
+           unit_startup_is_enabled "$startup"; then
+            healthy=$((healthy + 1))
+            if ((quiet == 0)); then
+                printf '[OK] %-38s startup=%s current=%s\n' \
+                    "$unit" "$startup" "$final_current"
+            fi
+        elif unit_runtime_is_active "$final_current"; then
+            skipped=$((skipped + 1))
+            if ((quiet == 0)); then
+                printf '[SKIPPED] %-33s startup=%s current=%s\n' \
+                    "$unit" "${startup:-unknown}" "$final_current"
+            fi
+        else
+            failed=$((failed + 1))
+            printf '[FAILED] %s startup=%s current=%s\n' \
+                "$unit" "${startup:-unknown}" "${final_current:-unknown}" >&2
+        fi
+    done < <(discover_backhaul_units)
+
+    if ((total == 0)); then
+        printf '[FAILED] No Backhaul service was found.\n' >&2
+        return 1
+    fi
+
+    if ((quiet == 0)); then
+        printf '\nSummary: total=%d healthy=%d repaired=%d skipped=%d failed=%d\n' \
+            "$total" "$healthy" "$repaired" "$skipped" "$failed"
+    elif ((repaired > 0)); then
+        printf '[REPAIRED] count=%d\n' "$repaired"
+    fi
+    ((failed == 0))
+}
+
+doctor() {
+    require_root
+    printf '=== BINARY ===\n'
+    if [[ -x "$BH_BIN" ]]; then
+        printf 'OK: %s\n' "$BH_BIN"
+        sha256sum "$BH_BIN" 2>/dev/null || true
+    else
+        printf 'FAILED: %s\n' "$BH_BIN"
+    fi
+
+    printf '\n=== TUNNELS ===\n'
+    list_tunnels
+
+    printf '\n=== HEALTH ===\n'
+    health_check || true
+
+    printf '\n=== LISTENING PORTS ===\n'
+    if command -v ss >/dev/null 2>&1; then
+        local listening
+        listening="$(ss -H -lntp 2>/dev/null | grep -F 'backhaul' || true)"
+        if [[ -n "$listening" ]]; then
+            printf '%s\n' "$listening"
+        else
+            printf 'No local Backhaul listening port was found.\n'
+            printf 'This is normal on a Client that connects to the Iran server.\n'
+        fi
+    else
+        warn "The ss command is not installed."
+    fi
+
+    printf '\n=== ACTIVE CONNECTIONS ===\n'
+    if command -v ss >/dev/null 2>&1; then
+        local connections
+        connections="$(ss -H -ntp 2>/dev/null | grep -F 'backhaul' || true)"
+        if [[ -n "$connections" ]]; then
+            printf '%s\n' "$connections"
+        else
+            printf 'No active Backhaul TCP connection was found.\n'
+        fi
+    fi
+
+    printf '\n=== RECENT WARNINGS ===\n'
+    if [[ "${BH_NO_SYSTEMD:-0}" != "1" ]] &&
+       command -v journalctl >/dev/null 2>&1; then
+        local unit
+        while IFS= read -r unit; do
+            [[ -n "$unit" ]] || continue
+            journalctl --since "30 minutes ago" --no-pager \
+                -u "$unit" -p warning | tail -n 30 || true
+        done < <(discover_backhaul_units)
+    fi
+}
+
+logs_tunnel() {
+    local first="${1:-}"
+    local second="${2:-}"
+    local -a matches=()
+    mapfile -t matches < <(resolve_units "$first" "$second" 2>/dev/null || true)
+    ((${#matches[@]} == 1)) ||
+        die "Select exactly one service to view logs."
+    exec journalctl -u "${matches[0]}" -n 100 -f
+}
+
+restart_tunnel() {
+    local first="${1:-}"
+    local second="${2:-}"
+    local -a matches=()
+    mapfile -t matches < <(resolve_units "$first" "$second" 2>/dev/null || true)
+    ((${#matches[@]} == 1)) ||
+        die "Select exactly one service to restart."
+    require_root
+    systemctl restart "${matches[0]}"
+    wait_for_unit_stable "${matches[0]}" ||
+        die "The service did not remain active after restart: ${matches[0]}"
+    systemctl is-active "${matches[0]}"
+}
+
+cron_manage() {
+    local action="${1:-status}"
+    shift || true
+
+    case "$action" in
+        install)
+            local interval=5
+            while (($#)); do
+                case "$1" in
+                    --interval)
+                        require_option_value "$1" "$#" "${2:-}"
+                        interval="$2"
+                        shift 2
+                        ;;
+                    *)
+                        die "Invalid cron option: $1"
+                        ;;
+                esac
+            done
+            [[ "$interval" =~ ^[0-9]+$ ]] ||
+                die "The cron interval must be a number."
+            ((interval >= 1 && interval <= 59)) ||
+                die "The cron interval must be between 1 and 59 minutes."
+            require_root
+            need_cmd flock
+            if [[ "${BH_NO_SYSTEMD:-0}" != "1" ]]; then
+                command -v cron >/dev/null 2>&1 ||
+                    die "The cron package is not installed. Run: apt-get install -y cron"
+                systemctl enable --now cron.service >/dev/null 2>&1 ||
+                    die "The cron service did not become active."
+            fi
+            install -d -m 755 "$(dirname "$BH_CRON_FILE")"
+            atomic_install_stdin "$BH_CRON_FILE" 644 <<EOF
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+*/$interval * * * * root flock -n /run/backhaul-manager-health.lock $BH_MANAGER_BIN health --repair --quiet
+EOF
+            success "Health check enabled every $interval minutes."
+            ;;
+        status)
+            if [[ -r "$BH_CRON_FILE" ]]; then
+                printf 'Cron: installed\nFile: %s\nSchedule: ' "$BH_CRON_FILE"
+                awk '!/^[[:space:]]*(#|$|SHELL=|PATH=)/ {print $1, $2, $3, $4, $5; exit}' \
+                    "$BH_CRON_FILE"
+            else
+                printf 'Cron: not-installed\n'
+            fi
+            ;;
+        remove)
+            require_root
+            if [[ -e "$BH_CRON_FILE" ]]; then
+                backup_file "$BH_CRON_FILE"
+                rm -f -- "$BH_CRON_FILE"
+                success "The health-check cron job was removed."
+            else
+                info "Health-check cron is not installed."
+            fi
+            ;;
+        *)
+            die "Cron commands: install, status, remove"
+            ;;
+    esac
+}
+
+backup_archive_create() {
+    local result_variable="$1"
+    local announce="${2:-1}"
+    require_root
+    need_cmd tar
+
+    local temp_dir created_archive unit config active enabled archive_config
+    temp_dir="$(mktemp -d)"
+    created_archive="$BH_BACKUP_DIR/backhaul-backup-$(timestamp).tar.gz"
+    trap 'rm -rf -- "$temp_dir"' RETURN
+    install -d -m 700 "$BH_BACKUP_DIR" \
+        "$temp_dir/configs" "$temp_dir/systemd" "$temp_dir/cron"
+
+    : >"$temp_dir/service-state.tsv"
+    : >"$temp_dir/config-paths.tsv"
+    while IFS= read -r unit; do
+        [[ -n "$unit" ]] || continue
+        cp -a -- "$(unit_file_path "$unit")" "$temp_dir/systemd/$unit"
+        config="$(unit_config_path "$unit" 2>/dev/null || true)"
+        if [[ -n "$config" && -r "$config" ]]; then
+            archive_config="${unit%.service}.toml"
+            cp -a -- "$config" "$temp_dir/configs/$archive_config"
+            printf '%s\t%s\t%s\n' "$unit" "$config" "$archive_config" \
+                >>"$temp_dir/config-paths.tsv"
+        fi
+        active="$(systemctl_state is-active "$unit")"
+        enabled="$(systemctl_state is-enabled "$unit")"
+        printf '%s\t%s\t%s\n' "$unit" "$enabled" "$active" \
+            >>"$temp_dir/service-state.tsv"
+    done < <(discover_backhaul_units)
+
+    if [[ -r "$BH_CRON_FILE" ]]; then
+        cp -a -- "$BH_CRON_FILE" "$temp_dir/cron/$(basename "$BH_CRON_FILE")"
+    fi
+    {
+        printf 'created_at=%s\n' "$(date --iso-8601=seconds)"
+        printf 'hostname=%s\n' "$(hostname)"
+        printf 'manager_version=%s\n' "$BH_MANAGER_VERSION"
+        printf 'format_version=3\n'
+    } >"$temp_dir/MANIFEST"
+
+    if ! tar -czf "${created_archive}.new" -C "$temp_dir" . ||
+       ! validate_backup_archive "${created_archive}.new"; then
+        rm -f -- "${created_archive}.new"
+        rm -rf -- "$temp_dir"
+        trap - RETURN
+        die "Backup verification failed; no archive was published."
+    fi
+    chmod 600 "${created_archive}.new"
+    mv -f -- "${created_archive}.new" "$created_archive"
+    rm -rf -- "$temp_dir"
+    trap - RETURN
+    printf -v "$result_variable" '%s' "$created_archive"
+    ((announce == 0)) || success "Backup created: $created_archive"
+}
+
+validate_backup_archive() {
+    local archive="$1"
+    local entry normalized type total_bytes
+    local maximum_bytes="${BH_BACKUP_MAX_UNCOMPRESSED_BYTES:-67108864}"
+    local -a entries=()
+    tar -tzf "$archive" >/dev/null || return 1
+    mapfile -t entries < <(tar -tzf "$archive")
+    ((${#entries[@]} <= 10000)) || return 1
+    [[ "$maximum_bytes" =~ ^[0-9]+$ ]] || maximum_bytes=67108864
+    total_bytes="$(
+        tar -tvzf "$archive" --numeric-owner 2>/dev/null |
+            awk '{ total += $3 } END { printf "%.0f", total }'
+    )"
+    [[ "$total_bytes" =~ ^[0-9]+$ ]] || return 1
+    ((total_bytes <= maximum_bytes)) || return 1
+
+    if printf '%s\n' "${entries[@]}" | sed 's#^\./##' | sort | uniq -d | grep -q .; then
+        return 1
+    fi
+
+    for entry in "${entries[@]}"; do
+        normalized="${entry#./}"
+        [[ -n "$normalized" ]] || continue
+        [[ "$normalized" != /* && "$normalized" != *'../'* &&
+           "$normalized" != '..' && "$normalized" != *'/..' ]] || return 1
+        case "$normalized" in
+            MANIFEST|service-state.tsv|config-paths.tsv|configs|configs/|systemd|systemd/|cron|cron/)
+                ;;
+            configs/[A-Za-z0-9_.@-]*|systemd/backhaul-[A-Za-z0-9_.@-]*.service|cron/[A-Za-z0-9_.@-]*)
+                [[ "$normalized" != */*/* ]] || return 1
+                ;;
+            *) return 1 ;;
+        esac
+    done
+
+    while IFS= read -r type; do
+        case "$type" in
+            -|d) ;;
+            *) return 1 ;;
+        esac
+    done < <(tar -tvzf "$archive" | cut -c1)
+}
+
+resolve_backup_archive() {
+    local requested="$1"
+    local result_variable="$2"
+    local base resolved_path
+    [[ -n "$requested" ]] || die "A backup archive name is required."
+    base="$(readlink -f -- "$BH_BACKUP_DIR" 2>/dev/null || true)"
+    [[ -n "$base" ]] || die "Backup directory does not exist: $BH_BACKUP_DIR"
+    if [[ "$requested" == */* ]]; then
+        resolved_path="$(readlink -f -- "$requested" 2>/dev/null || true)"
+    else
+        resolved_path="$(readlink -f -- "$BH_BACKUP_DIR/$requested" 2>/dev/null || true)"
+    fi
+    [[ -n "$resolved_path" && -f "$resolved_path" ]] ||
+        die "Backup archive not found: $requested"
+    [[ "$resolved_path" == "$base"/backhaul-backup-*.tar.gz ]] ||
+        die "Only Manager-created archives inside $BH_BACKUP_DIR may be restored."
+    printf -v "$result_variable" '%s' "$resolved_path"
+}
+
+restore_backup_archive() {
+    local requested="$1"
+    local confirmed="${2:-0}"
+    ((confirmed == 1)) || die "Backup restore requires --yes."
+    require_root
+    need_cmd tar
+
+    local archive="" safety_archive=""
+    resolve_backup_archive "$requested" archive
+    validate_backup_archive "$archive" ||
+        die "The backup archive is unsafe or corrupted: $archive"
+
+    # Create this before installing the RETURN cleanup trap below. This keeps
+    # the helper's own temporary-directory trap isolated from the restore.
+    backup_archive_create safety_archive 0
+
+    local extract_dir rollback_dir
+    extract_dir="$(mktemp -d)"
+    rollback_dir="$(mktemp -d)"
+    trap 'rm -rf -- "$extract_dir" "$rollback_dir"' RETURN
+    if ! tar -xzf "$archive" --no-same-owner --no-same-permissions -C "$extract_dir"; then
+        rm -rf -- "$extract_dir" "$rollback_dir"
+        trap - RETURN
+        die "The backup archive could not be extracted. Safety backup: $safety_archive"
+    fi
+    [[ -r "$extract_dir/MANIFEST" ]] || {
+        rm -rf -- "$extract_dir" "$rollback_dir"
+        trap - RETURN
+        die "Backup MANIFEST is missing. Safety backup: $safety_archive"
+    }
+
+    local -a units=() unit_sources=() config_sources=() config_destinations=()
+    local -a destination_paths=()
+    local -A previous_active=() previous_enabled=() previous_exists=()
+    local -A destination_seen=() restored_config_set=() referenced_config_set=()
+    local -A unit_set=() config_unit_seen=() archive_config_seen=()
+    local -A config_destination_source=()
+    local source destination unit state_unit state_enabled state_active
+    local config_unit original_config archive_config extra normalized_config
+    local failed=0 rollback_failed=0 index=0 format_version=""
+    local config_root
+    config_root="$(realpath -m -- "$BH_CONFIG_DIR")"
+    format_version="$(
+        sed -nE 's/^format_version=([0-9]+)$/\1/p' "$extract_dir/MANIFEST" |
+            head -n 1
+    )"
+    case "$format_version" in
+        1|2|3) ;;
+        *)
+            rm -rf -- "$extract_dir" "$rollback_dir"
+            trap - RETURN
+            die "Unsupported or invalid backup format. Safety backup: $safety_archive"
+            ;;
+    esac
+
+    while IFS= read -r source; do
+        [[ -n "$source" ]] || continue
+        unit="$(basename "$source")"
+        validate_unit_name "$unit"
+        [[ -z "${unit_set[$unit]:-}" ]] || {
+            failed=1
+            break
+        }
+        units+=("$unit")
+        unit_sources+=("$source")
+        unit_set["$unit"]=1
+        destination="$BH_SYSTEMD_DIR/$unit"
+        if [[ -z "${destination_seen[$destination]:-}" ]]; then
+            destination_paths+=("$destination")
+            destination_seen["$destination"]=1
+        fi
+    done < <(find "$extract_dir/systemd" -maxdepth 1 -type f -name 'backhaul-*.service' -print | sort)
+    ((${#units[@]} > 0)) || {
+        rm -rf -- "$extract_dir" "$rollback_dir"
+        trap - RETURN
+        die "The selected archive contains no Backhaul service. Safety backup: $safety_archive"
+    }
+
+    if [[ -r "$extract_dir/config-paths.tsv" &&
+          -s "$extract_dir/config-paths.tsv" ]]; then
+        while IFS=$'\t' read -r config_unit original_config archive_config extra; do
+            [[ -z "$extra" && -n "$config_unit" && -n "$original_config" &&
+               -n "$archive_config" ]] || failed=1
+            ((failed == 0)) || break
+            validate_unit_name "$config_unit"
+            [[ -n "${unit_set[$config_unit]:-}" &&
+               -z "${config_unit_seen[$config_unit]:-}" ]] || {
+                failed=1
+                break
+            }
+            [[ "$archive_config" =~ ^[A-Za-z0-9_.@-]+$ &&
+               -z "${archive_config_seen[$archive_config]:-}" ]] || {
+                failed=1
+                break
+            }
+            config_unit_seen["$config_unit"]=1
+            archive_config_seen["$archive_config"]=1
+            source="$extract_dir/configs/$archive_config"
+            [[ -f "$source" ]] || {
+                failed=1
+                break
+            }
+            validate_absolute_path "$original_config"
+            normalized_config="$(realpath -m -- "$original_config")"
+            [[ "$normalized_config" == "$config_root"/* ]] || {
+                warn "Backup config path is outside the managed config directory: $original_config"
+                failed=1
+                break
+            }
+            if [[ -n "${restored_config_set[$normalized_config]:-}" ]]; then
+                cmp -s -- "${config_destination_source[$normalized_config]}" "$source" || {
+                    warn "Conflicting configs target the same restore path: $normalized_config"
+                    failed=1
+                    break
+                }
+            else
+                config_sources+=("$source")
+                config_destinations+=("$normalized_config")
+                config_destination_source["$normalized_config"]="$source"
+                restored_config_set["$normalized_config"]=1
+                destination_paths+=("$normalized_config")
+                destination_seen["$normalized_config"]=1
+            fi
+        done <"$extract_dir/config-paths.tsv"
+        if ((failed == 0)); then
+            for unit in "${units[@]}"; do
+                [[ -n "${config_unit_seen[$unit]:-}" ]] || {
+                    failed=1
+                    break
+                }
+            done
+        fi
+        if ((failed == 0)); then
+            while IFS= read -r source; do
+                [[ -n "$source" ]] || continue
+                archive_config="$(basename "$source")"
+                [[ -n "${archive_config_seen[$archive_config]:-}" ]] || {
+                    warn "Unreferenced config file exists in the backup: $archive_config"
+                    failed=1
+                    break
+                }
+            done < <(find "$extract_dir/configs" -maxdepth 1 -type f -print | sort)
+        fi
+    else
+        # Backward compatibility with format 1/2 archives.
+        while IFS= read -r source; do
+            [[ -n "$source" ]] || continue
+            destination="$config_root/$(basename "$source")"
+            config_sources+=("$source")
+            config_destinations+=("$destination")
+            restored_config_set["$destination"]=1
+            if [[ -z "${destination_seen[$destination]:-}" ]]; then
+                destination_paths+=("$destination")
+                destination_seen["$destination"]=1
+            fi
+        done < <(find "$extract_dir/configs" -maxdepth 1 -type f -print | sort)
+    fi
+
+    ((failed == 0)) || {
+        rm -rf -- "$extract_dir" "$rollback_dir"
+        trap - RETURN
+        die "Backup config metadata is invalid. Safety backup: $safety_archive"
+    }
+
+    # Every restored unit must point to a config included in this archive.
+    for source in "${unit_sources[@]}"; do
+        destination="$(config_path_from_unit_file "$source" 2>/dev/null || true)"
+        [[ -n "$destination" ]] || {
+            failed=1
+            break
+        }
+        destination="$(realpath -m -- "$destination")"
+        [[ -n "${restored_config_set[$destination]:-}" ]] || {
+            warn "Unit $(basename "$source") references a config not present in the backup: $destination"
+            failed=1
+            break
+        }
+        referenced_config_set["$destination"]=1
+    done
+    if ((failed == 0)); then
+        for destination in "${config_destinations[@]}"; do
+            [[ -n "${referenced_config_set[$destination]:-}" ]] || {
+                warn "Backup contains an unreferenced config destination: $destination"
+                failed=1
+                break
+            }
+        done
+    fi
+    ((failed == 0)) || {
+        rm -rf -- "$extract_dir" "$rollback_dir"
+        trap - RETURN
+        die "Backup unit/config relationships are inconsistent. Safety backup: $safety_archive"
+    }
+
+    if [[ -r "$extract_dir/cron/$(basename "$BH_CRON_FILE")" ]]; then
+        destination="$BH_CRON_FILE"
+        if [[ -z "${destination_seen[$destination]:-}" ]]; then
+            destination_paths+=("$destination")
+            destination_seen["$destination"]=1
+        fi
+    fi
+
+    for unit in "${units[@]}"; do
+        previous_active["$unit"]="$(systemctl_state is-active "$unit")"
+        previous_enabled["$unit"]="$(systemctl_state is-enabled "$unit")"
+        if [[ "${BH_NO_SYSTEMD:-0}" != "1" ]] &&
+           command -v systemctl >/dev/null 2>&1; then
+            systemctl stop "$unit" >/dev/null 2>&1 || true
+        fi
+    done
+
+    for destination in "${destination_paths[@]}"; do
+        if [[ -e "$destination" || -L "$destination" ]]; then
+            previous_exists["$destination"]=1
+            cp -a -- "$destination" "$rollback_dir/$index" || failed=1
+        else
+            previous_exists["$destination"]=0
+        fi
+        index=$((index + 1))
+    done
+    ((failed == 0)) || {
+        rm -rf -- "$extract_dir" "$rollback_dir"
+        trap - RETURN
+        die "Could not stage live files for rollback; nothing was restored. Safety backup: $safety_archive"
+    }
+
+    install -d -m 700 "$BH_CONFIG_DIR"
+    install -d -m 755 "$BH_SYSTEMD_DIR"
+    for index in "${!config_sources[@]}"; do
+        atomic_install_file \
+            "${config_sources[$index]}" "${config_destinations[$index]}" 600 0 ||
+            failed=1
+    done
+    for index in "${!unit_sources[@]}"; do
+        atomic_install_file \
+            "${unit_sources[$index]}" "$BH_SYSTEMD_DIR/${units[$index]}" 644 0 ||
+            failed=1
+    done
+    if [[ -r "$extract_dir/cron/$(basename "$BH_CRON_FILE")" ]]; then
+        atomic_install_file \
+            "$extract_dir/cron/$(basename "$BH_CRON_FILE")" \
+            "$BH_CRON_FILE" 644 0 || failed=1
+    fi
+
+    if ((failed == 0)) && [[ "${BH_NO_SYSTEMD:-0}" != "1" ]] &&
+       command -v systemctl >/dev/null 2>&1; then
+        systemctl daemon-reload || failed=1
+        for unit in "${units[@]}"; do
+            state_enabled="enabled"
+            state_active="active"
+            if [[ -r "$extract_dir/service-state.tsv" ]]; then
+                local matched_state=0 archived_enabled="" archived_active=""
+                while IFS=$'\t' read -r state_unit archived_enabled archived_active; do
+                    if [[ "$state_unit" == "$unit" ]]; then
+                        state_enabled="$archived_enabled"
+                        state_active="$archived_active"
+                        matched_state=1
+                        break
+                    fi
+                done <"$extract_dir/service-state.tsv"
+                if ((matched_state == 0)); then
+                    state_enabled="enabled"
+                    state_active="active"
+                fi
+            fi
+            if unit_startup_is_enabled "$state_enabled"; then
+                systemctl enable "$unit" >/dev/null 2>&1 || failed=1
+            else
+                systemctl disable "$unit" >/dev/null 2>&1 || true
+            fi
+            if unit_runtime_is_active "$state_active"; then
+                if ! systemctl restart "$unit" || ! wait_for_unit_stable "$unit"; then
+                    failed=1
+                fi
+            else
+                systemctl stop "$unit" >/dev/null 2>&1 || true
+            fi
+        done
+    fi
+
+    if ((failed == 1)); then
+        warn "Restore failed; rolling back live files and service states."
+        index=0
+        for destination in "${destination_paths[@]}"; do
+            rm -f -- "$destination" || rollback_failed=1
+            if [[ "${previous_exists[$destination]:-0}" == "1" ]]; then
+                cp -a -- "$rollback_dir/$index" "$destination" || rollback_failed=1
+            fi
+            index=$((index + 1))
+        done
+        if [[ "${BH_NO_SYSTEMD:-0}" != "1" ]] &&
+           command -v systemctl >/dev/null 2>&1; then
+            systemctl daemon-reload || rollback_failed=1
+            for unit in "${units[@]}"; do
+                if unit_startup_is_enabled "${previous_enabled[$unit]:-unknown}"; then
+                    systemctl enable "$unit" >/dev/null 2>&1 || rollback_failed=1
+                else
+                    systemctl disable "$unit" >/dev/null 2>&1 || true
+                fi
+                if unit_runtime_is_active "${previous_active[$unit]:-unknown}"; then
+                    if ! systemctl restart "$unit" ||
+                       ! wait_for_unit_stable "$unit"; then
+                        rollback_failed=1
+                    fi
+                else
+                    systemctl stop "$unit" >/dev/null 2>&1 || true
+                fi
+            done
+        fi
+        rm -rf -- "$extract_dir" "$rollback_dir"
+        trap - RETURN
+        if ((rollback_failed == 1)); then
+            die "Backup restore failed and rollback was incomplete. Safety backup: $safety_archive"
+        fi
+        die "Backup restore failed. Previous files and service states were restored. Safety backup: $safety_archive"
+    fi
+
+    rm -rf -- "$extract_dir" "$rollback_dir"
+    trap - RETURN
+    success "Backup restored: $archive"
+    success "Pre-restore safety backup: $safety_archive"
+}
+
+backup_manage() {
+    local action="${1:-list}"
+    case "$action" in
+        create)
+            local archive=""
+            backup_archive_create archive 1
+            ;;
+        list)
+            if [[ ! -d "$BH_BACKUP_DIR" ]]; then
+                printf 'No backups exist.\n'
+                return 0
+            fi
+            local backups
+            backups="$(
+                find "$BH_BACKUP_DIR" -maxdepth 1 -type f \
+                    -name 'backhaul-backup-*.tar.gz' \
+                    -printf '%TY-%Tm-%Td %TH:%TM  %10s bytes  %p\n' |
+                    sort -r
+            )"
+            if [[ -n "$backups" ]]; then
+                printf '%s\n' "$backups"
+            else
+                printf 'No backups exist.\n'
+            fi
+            ;;
+        restore)
+            local requested="${2:-}"
+            local confirmed=0
+            shift 2 || true
+            while (($#)); do
+                case "$1" in
+                    --yes) confirmed=1; shift ;;
+                    *) die "Unknown backup restore option: $1" ;;
+                esac
+            done
+            restore_backup_archive "$requested" "$confirmed"
+            ;;
+        *)
+            die "Backup commands: create, list, restore ARCHIVE --yes"
+            ;;
+    esac
+}
+
+list_config_mappings() {
+    local config="$1"
+    awk '
+        function trim(value) {
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+            gsub(/^"|"$/, "", value)
+            return value
+        }
+        function emit_items(value, parts, count, i, item) {
+            sub(/[[:space:]]*#.*/, "", value)
+            count=split(value, parts, ",")
+            for (i=1; i<=count; i++) {
+                item=trim(parts[i])
+                if (length(item)) print item
+            }
+        }
+        /^[[:space:]]*ports[[:space:]]*=[[:space:]]*\[/ {
+            found=1
+            line=$0
+            sub(/^[^[]*\[/, "", line)
+            if (line ~ /\]/) {
+                sub(/\].*$/, "", line)
+                emit_items(line)
+                exit
+            }
+            inside=1
+            next
+        }
+        inside {
+            line=$0
+            if (line ~ /\]/) {
+                sub(/\].*$/, "", line)
+                emit_items(line)
+                exit
+            }
+            emit_items(line)
+        }
+        END {
+            if (!found) exit 42
+        }
+    ' "$config"
+}
+
+server_control_port_from_config() {
+    local config="$1"
+    local bind_address
+    bind_address="$(
+        awk '
+            /^[[:space:]]*bind_addr[[:space:]]*=/ {
+                value=$0
+                sub(/^[^=]*=[[:space:]]*/, "", value)
+                sub(/[[:space:]]*#.*/, "", value)
+                gsub(/^[[:space:]]*"|"[[:space:]]*$/, "", value)
+                print value
+                exit
+            }
+        ' "$config"
+    )"
+    [[ -n "$bind_address" ]] || return 1
+    printf '%s\n' "${bind_address##*:}"
+}
+
+rewrite_config_mappings() {
+    local config="$1"
+    local action="$2"
+    local value="$3"
+    local output="$4"
+
+    awk -v action="$action" -v wanted="$value" '
+        function trim(value) {
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+            gsub(/^"|"$/, "", value)
+            return value
+        }
+        function collect(value, parts, count, i, item) {
+            sub(/[[:space:]]*#.*/, "", value)
+            count=split(value, parts, ",")
+            for (i=1; i<=count; i++) {
+                item=trim(parts[i])
+                if (length(item)) mappings[++mapping_count]=item
+            }
+        }
+        function print_block(i, item, public_port) {
+            printf "%sports = [\n", indent
+            for (i=1; i<=mapping_count; i++) {
+                item=mappings[i]
+                split(item, parts, "=")
+                public_port=parts[1]
+                if (action == "remove" && public_port == wanted) continue
+                printf "%s    \"%s\",\n", indent, item
+            }
+            if (action == "add") {
+                printf "%s    \"%s\",\n", indent, wanted
+            }
+            printf "%s]\n", indent
+        }
+        !inside && /^[[:space:]]*ports[[:space:]]*=[[:space:]]*\[/ {
+            found=1
+            match($0, /^[[:space:]]*/)
+            indent=substr($0, RSTART, RLENGTH)
+            line=$0
+            sub(/^[^[]*\[/, "", line)
+            if (line ~ /\]/) {
+                sub(/\].*$/, "", line)
+                collect(line)
+                print_block()
+                next
+            }
+            inside=1
+            next
+        }
+        inside {
+            line=$0
+            if (line ~ /\]/) {
+                sub(/\].*$/, "", line)
+                collect(line)
+                print_block()
+                inside=0
+                next
+            }
+            collect(line)
+            next
+        }
+        { print }
+        END {
+            if (!found || inside) exit 42
+        }
+    ' "$config" >"$output"
+}
+
+mapping_manage() {
+    local action="${1:-list}"
+    local selector="${2:-}"
+    local value="${3:-}"
+    local -a matches=()
+    local unit config role
+    mapfile -t matches < <(resolve_units "$selector" 2>/dev/null || true)
+    ((${#matches[@]} == 1)) ||
+        die "Select exactly one service to manage port mappings."
+    unit="${matches[0]}"
+    config="$(unit_config_path "$unit" 2>/dev/null || true)"
+    [[ -n "$config" && -r "$config" ]] ||
+        die "Service config not found: $unit"
+    role="$(unit_role_from_config "$config")"
+    [[ "$role" == "server" ]] ||
+        die "Port mappings may be defined only on a server service."
+
+    case "$action" in
+        list)
+            printf 'Mappings for %s:\n' "$unit"
+            local mappings_output mapping_line
+            mappings_output="$(list_config_mappings "$config")" ||
+                die "The ports section could not be read from the config."
+            if [[ -n "$mappings_output" ]]; then
+                while IFS= read -r mapping_line; do
+                    printf '  %s\n' "$mapping_line"
+                done <<<"$mappings_output"
+            else
+                printf '  (none)\n'
+            fi
+            ;;
+        add)
+            [[ -n "$value" ]] ||
+                die "A mapping must be provided."
+            validate_mapping "$value"
+            local public_port="${value%%=*}"
+            local control_port=""
+            control_port="$(server_control_port_from_config "$config" 2>/dev/null || true)"
+            [[ -z "$control_port" || "$public_port" != "$control_port" ]] ||
+                die "Public port $public_port conflicts with the tunnel control port."
+            if list_config_mappings "$config" |
+                awk -F= '{print $1}' |
+                grep -qx "$public_port"; then
+                die "Public port $public_port already exists."
+            fi
+
+            local temp backup
+            temp="$(mktemp "$(dirname "$config")/.mapping.XXXXXX")"
+            backup="${config}.bak.$(timestamp)"
+            cp -a -- "$config" "$backup"
+            if ! rewrite_config_mappings "$config" add "$value" "$temp"; then
+                rm -f -- "$temp"
+                die "The ports section was not found in the config."
+            fi
+            if ! atomic_install_file "$temp" "$config" 600 0; then
+                rm -f -- "$temp"
+                die "The updated config could not be installed."
+            fi
+            rm -f -- "$temp"
+            if [[ "${BH_NO_SYSTEMD:-0}" == "1" ]] ||
+               { systemctl restart "$unit" &&
+                 wait_for_unit_stable "$unit"; }; then
+                success "Mapping added: $value"
+            else
+                cp -a -- "$backup" "$config"
+                [[ "${BH_NO_SYSTEMD:-0}" == "1" ]] ||
+                    systemctl restart "$unit" || true
+                die "The service failed to start; the previous config was restored."
+            fi
+            ;;
+        remove)
+            validate_port "$value"
+            if ! list_config_mappings "$config" |
+                awk -F= '{print $1}' |
+                grep -qx "$value"; then
+                die "Public port $value is not present in the mappings."
+            fi
+
+            local temp_remove backup_remove
+            temp_remove="$(mktemp "$(dirname "$config")/.mapping.XXXXXX")"
+            backup_remove="${config}.bak.$(timestamp)"
+            cp -a -- "$config" "$backup_remove"
+            if ! rewrite_config_mappings "$config" remove "$value" "$temp_remove"; then
+                rm -f -- "$temp_remove"
+                die "The ports section was not found in the config."
+            fi
+            if ! atomic_install_file "$temp_remove" "$config" 600 0; then
+                rm -f -- "$temp_remove"
+                die "The updated config could not be installed."
+            fi
+            rm -f -- "$temp_remove"
+            if [[ "${BH_NO_SYSTEMD:-0}" == "1" ]] ||
+               { systemctl restart "$unit" &&
+                 wait_for_unit_stable "$unit"; }; then
+                success "Port mapping $value was removed."
+            else
+                cp -a -- "$backup_remove" "$config"
+                [[ "${BH_NO_SYSTEMD:-0}" == "1" ]] ||
+                    systemctl restart "$unit" || true
+                die "The service failed to start; the previous config was restored."
+            fi
+            ;;
+        *)
+            die "Mapping commands: list, add, remove"
+            ;;
+    esac
+}
+
+retire_unit() {
+    local selector="${1:-}"
+    local confirmation="${2:-}"
+    [[ "$confirmation" == "--yes" ]] ||
+        die "--yes is required to move a service to the archive."
+    local -a matches=()
+    mapfile -t matches < <(resolve_units "$selector" 2>/dev/null || true)
+    ((${#matches[@]} == 1)) ||
+        die "Select exactly one service to archive."
+
+    require_root
+    local unit="${matches[0]}"
+    local config unit_file retired_dir
+    config="$(unit_config_path "$unit" 2>/dev/null || true)"
+    unit_file="$(unit_file_path "$unit")"
+    retired_dir="$BH_BACKUP_DIR/retired-$(timestamp)-${unit%.service}"
+
+    backup_manage create >/dev/null
+    install -d -m 700 "$retired_dir"
+    cp -a -- "$unit_file" "$retired_dir/"
+    cmp -s -- "$unit_file" "$retired_dir/$(basename "$unit_file")" ||
+        die "The unit backup could not be verified; nothing was removed."
+    if [[ -n "$config" && -e "$config" ]]; then
+        cp -a -- "$config" "$retired_dir/"
+        cmp -s -- "$config" "$retired_dir/$(basename "$config")" ||
+            die "The config backup could not be verified; nothing was removed."
+    fi
+    printf 'unit=%s\nconfig=%s\n' "$unit" "${config:-unknown}" \
+        >"$retired_dir/RESTORE_INFO"
+
+    if [[ "${BH_NO_SYSTEMD:-0}" != "1" ]]; then
+        if ! systemctl disable --now "$unit" >/dev/null 2>&1; then
+            die "The service could not be stopped. Its files were not removed."
+        fi
+        if systemctl is-active --quiet "$unit"; then
+            die "The service is still active. Its files were not removed."
+        fi
+    fi
+    rm -f -- "$unit_file"
+    if [[ -n "$config" && -e "$config" ]]; then
+        rm -f -- "$config"
+    fi
+    if [[ "${BH_NO_SYSTEMD:-0}" != "1" ]]; then
+        systemctl daemon-reload
+    fi
+    success "The tunnel was not deleted; it was moved to a recoverable archive: $retired_dir"
+}
+
+remove_tunnel() {
+    local role="${1:-}"
+    local name="${2:-}"
+    [[ "$role" == "server" || "$role" == "client" ]] ||
+        die "Role must be server or client."
+    validate_name "$name"
+    retire_unit "$(unit_name "$role" "$name")" --yes
+}
+
+main() {
+    local command="${1:-}"
+    case "$command" in
+        menu)
+            [[ -x "$BH_MENU_BIN" ]] ||
+                die "The interactive menu is not installed: $BH_MENU_BIN"
+            exec "$BH_MENU_BIN"
+            ;;
+        server)
+            [[ "${2:-}" == "add" ]] || die "Valid command: server add"
+            shift 2
+            server_add "$@"
+            ;;
+        client)
+            [[ "${2:-}" == "add" ]] || die "Valid command: client add"
+            shift 2
+            client_add "$@"
+            ;;
+        binary)
+            [[ "${2:-}" == "install" ]] || die "Valid command: binary install"
+            shift 2
+            binary_install "$@"
+            ;;
+        list)
+            list_tunnels
+            ;;
+        status)
+            shift
+            status_tunnels "${1:-}"
+            ;;
+        health)
+            shift
+            health_check "$@"
+            ;;
+        cron)
+            shift
+            cron_manage "$@"
+            ;;
+        backup)
+            shift
+            backup_manage "$@"
+            ;;
+        mapping)
+            shift
+            mapping_manage "$@"
+            ;;
+        retire)
+            shift
+            retire_unit "$@"
+            ;;
+        doctor)
+            doctor
+            ;;
+        logs)
+            shift
+            logs_tunnel "$@"
+            ;;
+        restart)
+            shift
+            restart_tunnel "$@"
+            ;;
+        remove)
+            shift
+            remove_tunnel "$@"
+            ;;
+        version)
+            printf 'backhaul-homa-ghost-tunnel-manager %s\n' "$BH_MANAGER_VERSION"
+            ;;
+        -h|--help|help|"")
+            usage
+            ;;
+        *)
+            die "Unknown command: $command"
+            ;;
+    esac
+}
+
+main "$@"
