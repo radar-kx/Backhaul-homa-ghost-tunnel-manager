@@ -289,19 +289,16 @@ def run_log_interrupt_session() -> bytes:
                 elif phase == 1 and b"Tunnel management:" in output:
                     os.write(master, b"2\n")
                     phase = 2
-                elif phase == 2 and b"Press Ctrl+C to stop live logs." in output:
+                elif phase == 2 and b"Press Ctrl+C to return directly" in output:
                     time.sleep(0.1)
                     os.killpg(pid, signal.SIGINT)
                     phase = 3
-                elif phase == 3 and b"Press Enter to continue..." in output:
-                    os.write(master, b"\n")
+                elif phase == 3 and output.count(b"Tunnel management:") >= 2:
+                    os.write(master, b"0\n")
                     phase = 4
-                elif phase == 4 and output.count(b"Tunnel management:") >= 2:
+                elif phase == 4 and output.count(b"Select an option:") >= 2:
                     os.write(master, b"0\n")
                     phase = 5
-                elif phase == 5 and output.count(b"Select an option:") >= 2:
-                    os.write(master, b"0\n")
-                    phase = 6
 
                 waited, child_status = os.waitpid(pid, os.WNOHANG)
                 if waited == pid:
@@ -322,7 +319,7 @@ def run_log_interrupt_session() -> bytes:
                     os.kill(pid, signal.SIGKILL)
                     _, status = os.waitpid(pid, 0)
 
-        if phase != 6:
+        if phase != 5:
             raise AssertionError(f"live-log Ctrl+C flow stopped at phase {phase}: {output!r}")
         if status is None or os.waitstatus_to_exitcode(status) != 0:
             raise AssertionError(f"live-log Ctrl+C flow exited abnormally: {output!r}")
@@ -331,10 +328,7 @@ def run_log_interrupt_session() -> bytes:
 
 def assert_normal_screen_lifecycle(output: bytes, label: str) -> None:
     title = b"HOMA GHOST TUNNEL MANAGER"
-    clear_viewport = b"\x1b[2J\x1b[H"
     forbidden = (
-        b"\x1b[?1049h",
-        b"\x1b[?1049l",
         b"\x1b[?1047h",
         b"\x1b[?1047l",
         b"\x1b[3J",
@@ -343,14 +337,16 @@ def assert_normal_screen_lifecycle(output: bytes, label: str) -> None:
     for sequence in forbidden:
         if sequence in output:
             raise AssertionError(
-                f"{label}: destructive/alternate-screen sequence found: {sequence!r}"
+                f"{label}: forbidden terminal sequence found: {sequence!r}"
             )
+    if output.count(b"\x1b[?1049h") != 1 or output.count(b"\x1b[?1049l") != 1:
+        raise AssertionError(f"{label}: alternate-screen entry/exit is not balanced")
     if HISTORY_MARKER not in output or title not in output:
         raise AssertionError(f"{label}: history marker or title is missing")
     if output.index(HISTORY_MARKER) > output.index(title):
         raise AssertionError(f"{label}: pre-bh history was emitted after the menu")
-    if output.count(clear_viewport) < 2:
-        raise AssertionError(f"{label}: visible viewport was not cleaned on entry and exit")
+    if output.index(b"\x1b[?1049h") > output.index(title):
+        raise AssertionError(f"{label}: menu rendered before alternate-screen entry")
 
     logo_lines = (
         b" _   _  ___  __  __    _",
@@ -363,20 +359,17 @@ def assert_normal_screen_lifecycle(output: bytes, label: str) -> None:
         if line not in output:
             raise AssertionError(f"{label}: incomplete HOMA logo; missing {line!r}")
 
-    final_clear = output.rfind(clear_viewport)
-    if final_clear < output.rfind(title):
-        raise AssertionError(f"{label}: menu text remained on the visible screen after exit")
-    if title in output[final_clear + len(clear_viewport) :]:
+    final_leave = output.rfind(b"\x1b[?1049l")
+    if final_leave < output.rfind(title):
+        raise AssertionError(f"{label}: alternate screen closed before final menu cleanup")
+    if title in output[final_leave + len(b"\x1b[?1049l") :]:
         raise AssertionError(f"{label}: title was printed again after final cleanup")
 
 
 def assert_compact_menu_lifecycle(output: bytes, label: str) -> None:
     titles = (b"HOMA GHOST v", b"HOMA GHOST TUNNEL MANAGER v")
     title = next((candidate for candidate in titles if candidate in output), None)
-    clear_viewport = b"\x1b[2J\x1b[H"
     forbidden = (
-        b"\x1b[?1049h",
-        b"\x1b[?1049l",
         b"\x1b[?1047h",
         b"\x1b[?1047l",
         b"\x1b[3J",
@@ -384,16 +377,15 @@ def assert_compact_menu_lifecycle(output: bytes, label: str) -> None:
     for sequence in forbidden:
         if sequence in output:
             raise AssertionError(
-                f"{label}: destructive/alternate-screen sequence found: {sequence!r}"
+                f"{label}: forbidden terminal sequence found: {sequence!r}"
             )
+    if output.count(b"\x1b[?1049h") != 1 or output.count(b"\x1b[?1049l") != 1:
+        raise AssertionError(f"{label}: alternate-screen entry/exit is not balanced")
     if HISTORY_MARKER not in output or title is None:
         raise AssertionError(f"{label}: compact title or history marker is missing")
     if output.index(HISTORY_MARKER) > output.index(title):
         raise AssertionError(f"{label}: pre-bh history was emitted after the menu")
-    if output.count(clear_viewport) < 2:
-        raise AssertionError(f"{label}: viewport was not cleaned on entry and exit")
-    final_clear = output.rfind(clear_viewport)
-    if final_clear < output.rfind(title):
+    if output.rfind(b"\x1b[?1049l") < output.rfind(title):
         raise AssertionError(f"{label}: compact menu remained visible after exit")
 
 
@@ -527,27 +519,14 @@ def assert_menu_absent_from_scrollback(
     terminal_rows: int,
     terminal_columns: int = 80,
 ) -> None:
-    terminal = NormalScreenModel(rows=terminal_rows, columns=terminal_columns)
-    terminal.feed(output)
-    history = "\n".join(terminal.history)
-    if HISTORY_MARKER.decode() not in history:
-        raise AssertionError(f"{label}: pre-bh output did not remain in scrollback")
-    forbidden_history = (
-        "HOMA GHOST TUNNEL MANAGER",
-        "HOMA GHOST v",
-        "Manager version:",
-        "Repository: radar-kx/Backhaul-homa-ghost-tunnel-manager",
-        "Create a new tunnel (IPv4 / IPv6)",
-        "Select an option:",
-        "=== Tunnel status ===",
-        "=== Automatic health-check status ===",
-        "Press Enter to continue...",
-    )
-    for marker in forbidden_history:
-        if marker in history:
-            raise AssertionError(
-                f"{label}: stale menu frame leaked into scrollback: {marker!r}"
-            )
+    enter = output.find(b"\x1b[?1049h")
+    leave = output.rfind(b"\x1b[?1049l")
+    if enter < 0 or leave <= enter:
+        raise AssertionError(f"{label}: alternate-screen boundaries are missing")
+    if HISTORY_MARKER not in output[:enter]:
+        raise AssertionError(f"{label}: pre-homa history marker moved into the UI buffer")
+    if b"HOMA GHOST" in output[leave + len(b"\x1b[?1049l"):]:
+        raise AssertionError(f"{label}: menu text leaked after alternate-screen exit")
 
 
 def assert_compact_shell_round_trip(
@@ -556,23 +535,10 @@ def assert_compact_shell_round_trip(
     terminal_rows: int,
     terminal_columns: int = 80,
 ) -> None:
-    """Model the shell prompt printed immediately after `bh` exits."""
-    terminal = NormalScreenModel(rows=terminal_rows, columns=terminal_columns)
-    terminal.feed(output)
-    terminal.feed(POST_BH_PROMPT)
-
-    if terminal.history != list(PRE_BH_LINES):
-        raise AssertionError(
-            f"{label}: exit introduced blank rows or menu remnants after pre-bh "
-            f"history: {terminal.history!r}"
-        )
-
-    first_screen_line = terminal._line_text(0)
-    if first_screen_line != POST_BH_PROMPT.decode().rstrip():
-        raise AssertionError(
-            f"{label}: shell prompt did not return at the top of the clean "
-            f"viewport: {first_screen_line!r}"
-        )
+    """Alternate-screen exit must be the final UI terminal-mode transition."""
+    leave = output.rfind(b"\x1b[?1049l")
+    if leave < 0 or b"\x1b[?1049h" in output[leave + 8:]:
+        raise AssertionError(f"{label}: alternate screen was re-entered after exit")
 
 
 def down(count: int) -> bytes:
@@ -626,6 +592,14 @@ for unchanged_option in (
         raise AssertionError(
             "arrow navigation repainted an unchanged menu row: "
             f"{unchanged_option!r}"
+        )
+
+rapid_arrows = run_session(down(200) + up(200) + up() + b"\n")
+assert_normal_screen_lifecycle(rapid_arrows, "rapid held-arrow coalescing")
+for stable_option in (b"2) Manage tunnels", b"3) Show all tunnel statuses"):
+    if rapid_arrows.count(stable_option) > 2:
+        raise AssertionError(
+            f"rapid arrows caused redundant option repaint: {stable_option!r}"
         )
 
 all_top_menus = run_session(

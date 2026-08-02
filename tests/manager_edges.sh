@@ -14,7 +14,8 @@ export BH_SYSTEMD_DIR="$TEST_ROOT/etc/systemd/system"
 export BH_PROJECT_DIR="$ROOT_DIR"
 export BH_MANAGER_BIN="$ROOT_DIR/bin/backhaul-manager"
 export BH_MENU_BIN="$ROOT_DIR/bin/backhaul-menu"
-export BH_SHORTCUT_BIN="$ROOT_DIR/bin/bh"
+export BH_SHORTCUT_BIN="$ROOT_DIR/bin/homa"
+export BH_LEGACY_SHORTCUT_BIN="$ROOT_DIR/bin/bh"
 export BH_CRON_FILE="$TEST_ROOT/etc/cron.d/backhaul-manager-health"
 export BH_BACKUP_DIR="$TEST_ROOT/var/backups/backhaul-manager"
 
@@ -50,6 +51,12 @@ expect_failure "--version requires a value." \
 expect_failure "--interval requires a value." \
     "$BH_MANAGER_BIN" cron install --interval
 
+expect_failure "--latest and --version cannot be used together." \
+    "$BH_MANAGER_BIN" binary install --latest --version v0.7.2
+
+expect_failure "--allow-unverified-download is only valid for online downloads." \
+    "$BH_MANAGER_BIN" binary install --file "$BH_BIN" --allow-unverified-download
+
 expect_failure "Invalid bind IPv4 address" \
     "$BH_MANAGER_BIN" server add \
         --name badip \
@@ -61,6 +68,31 @@ expect_failure "Invalid IPv4 address" \
     "$BH_MANAGER_BIN" client add \
         --name badip \
         --remote 999.1.1.1:9000 \
+        --token 0123456789abcdef0123456789abcdef
+
+expect_failure "Invalid IPv6 address" \
+    "$BH_MANAGER_BIN" client add \
+        --name bad-ipv6 \
+        --remote '[::::]:9000' \
+        --token 0123456789abcdef0123456789abcdef
+
+expect_failure "Invalid bind IPv6 address" \
+    "$BH_MANAGER_BIN" server add \
+        --name bad-bind-ipv6 \
+        --bind '[::::]:9000' \
+        --token 0123456789abcdef0123456789abcdef \
+        --map 8000=127.0.0.1:80
+
+expect_failure "Invalid IP address or domain" \
+    "$BH_MANAGER_BIN" client add \
+        --name bad-domain \
+        --remote '_:9000' \
+        --token 0123456789abcdef0123456789abcdef
+
+expect_failure "Invalid IP address or domain" \
+    "$BH_MANAGER_BIN" client add \
+        --name bad-domain-label \
+        --remote '-invalid.example:9000' \
         --token 0123456789abcdef0123456789abcdef
 
 expect_failure "Ports must not contain leading zeroes" \
@@ -146,10 +178,15 @@ expect_failure "conflicts with the tunnel control port" \
 "$BH_MANAGER_BIN" mapping remove \
     backhaul-legacy-inline.service 8101
 
-python3 - "$inline_config" <<'PY'
+python3 - "$inline_config" "$ROOT_DIR/tests" <<'PY'
 import pathlib
 import sys
-import tomllib
+
+try:
+    import tomllib
+except ModuleNotFoundError:
+    sys.path.insert(0, sys.argv[2])
+    import tomllib_compat as tomllib
 
 config = tomllib.loads(pathlib.Path(sys.argv[1]).read_text())
 assert config["server"]["ports"] == [
@@ -164,6 +201,11 @@ BH_BACKUP_DIR="$empty_backup_dir" "$BH_MANAGER_BIN" backup list |
 
 "$BH_MANAGER_BIN" backup create
 "$BH_MANAGER_BIN" backup create
+backup_list_output="$("$BH_MANAGER_BIN" backup list)"
+grep -Fq 'Date:' <<<"$backup_list_output" || fail "backup list omitted the date"
+grep -Fq 'Size:' <<<"$backup_list_output" || fail "backup list omitted the size"
+grep -Fq 'Format: 3' <<<"$backup_list_output" || fail "backup list omitted format version 3"
+grep -Fq 'Tunnels:' <<<"$backup_list_output" || fail "backup list omitted tunnel count"
 backup_count="$(
     find "$BH_BACKUP_DIR" -maxdepth 1 -type f \
         -name 'backhaul-backup-*.tar.gz' | wc -l
@@ -232,10 +274,15 @@ for transport in "${transports[@]}"; do
     "$BH_MANAGER_BIN" "${server_args[@]}" >/dev/null
 done
 
-python3 - "$BH_CONFIG_DIR" <<'PY'
+python3 - "$BH_CONFIG_DIR" "$ROOT_DIR/tests" <<'PY'
 import pathlib
 import sys
-import tomllib
+
+try:
+    import tomllib
+except ModuleNotFoundError:
+    sys.path.insert(0, sys.argv[2])
+    import tomllib_compat as tomllib
 
 root = pathlib.Path(sys.argv[1])
 transports = ("tcp", "tcpmux", "ws", "wss", "wsmux", "wssmux")

@@ -3,12 +3,13 @@ set -Eeuo pipefail
 
 # Bootstrap installer for both local packages and direct HTTPS installation.
 
-PROJECT_VERSION="1.1.11"
+PROJECT_VERSION="1.1.13"
 RAW_BASE="${BH_RAW_BASE:-https://raw.githubusercontent.com/radar-kx/Backhaul-homa-ghost-tunnel-manager/main}"
 PROJECT_DIR="${BH_PROJECT_DIR:-/opt/backhaul-tunnel-manager}"
 MANAGER_BIN="${BH_MANAGER_BIN:-/usr/local/sbin/backhaul-manager}"
 MENU_BIN="${BH_MENU_BIN:-/usr/local/sbin/backhaul-menu}"
-SHORTCUT_BIN="${BH_SHORTCUT_BIN:-/usr/local/bin/bh}"
+SHORTCUT_BIN="${BH_SHORTCUT_BIN:-/usr/local/bin/homa}"
+LEGACY_SHORTCUT_BIN="${BH_LEGACY_SHORTCUT_BIN:-/usr/local/bin/bh}"
 BACKHAUL_BIN="${BH_BIN:-/usr/local/bin/backhaul}"
 VERSION="${BH_VERSION_DEFAULT:-v0.7.2}"
 VERSION_EXPLICIT=0
@@ -155,17 +156,20 @@ install -d -m 755 "$STAGE_DIR/lib" "$STAGE_DIR/bin"
 if [[ -r "$SCRIPT_DIR/lib/common.sh" &&
       -r "$SCRIPT_DIR/bin/backhaul-manager" &&
       -r "$SCRIPT_DIR/bin/backhaul-menu" &&
+      -r "$SCRIPT_DIR/bin/homa" &&
       -r "$SCRIPT_DIR/bin/bh" ]]; then
     install -m 644 "$SCRIPT_DIR/lib/common.sh" "$STAGE_DIR/lib/common.sh"
     install -m 755 "$SCRIPT_DIR/bin/backhaul-manager" \
         "$STAGE_DIR/bin/backhaul-manager"
     install -m 755 "$SCRIPT_DIR/bin/backhaul-menu" \
         "$STAGE_DIR/bin/backhaul-menu"
+    install -m 755 "$SCRIPT_DIR/bin/homa" "$STAGE_DIR/bin/homa"
     install -m 755 "$SCRIPT_DIR/bin/bh" "$STAGE_DIR/bin/bh"
 else
     download_bootstrap "$RAW_BASE/lib/common.sh" "$STAGE_DIR/lib/common.sh"
     download_bootstrap "$RAW_BASE/bin/backhaul-manager" "$STAGE_DIR/bin/backhaul-manager"
     download_bootstrap "$RAW_BASE/bin/backhaul-menu" "$STAGE_DIR/bin/backhaul-menu"
+    download_bootstrap "$RAW_BASE/bin/homa" "$STAGE_DIR/bin/homa"
     download_bootstrap "$RAW_BASE/bin/bh" "$STAGE_DIR/bin/bh"
 fi
 
@@ -173,6 +177,7 @@ for staged_script in \
     "$STAGE_DIR/lib/common.sh" \
     "$STAGE_DIR/bin/backhaul-manager" \
     "$STAGE_DIR/bin/backhaul-menu" \
+    "$STAGE_DIR/bin/homa" \
     "$STAGE_DIR/bin/bh"; do
     [[ -s "$staged_script" ]] ||
         die_bootstrap "A required Manager file is empty: $staged_script"
@@ -190,7 +195,8 @@ for destination_dir in \
     "$PROJECT_DIR/bin" \
     "$(dirname "$MANAGER_BIN")" \
     "$(dirname "$MENU_BIN")" \
-    "$(dirname "$SHORTCUT_BIN")"; do
+    "$(dirname "$SHORTCUT_BIN")" \
+    "$(dirname "$LEGACY_SHORTCUT_BIN")"; do
     [[ -d "$destination_dir" ]] || install -d -m 755 "$destination_dir"
 done
 
@@ -198,21 +204,25 @@ manager_sources=(
     "$STAGE_DIR/lib/common.sh"
     "$STAGE_DIR/bin/backhaul-manager"
     "$STAGE_DIR/bin/backhaul-menu"
+    "$STAGE_DIR/bin/homa"
     "$STAGE_DIR/bin/bh"
     "$STAGE_DIR/bin/backhaul-manager"
     "$STAGE_DIR/bin/backhaul-menu"
+    "$STAGE_DIR/bin/homa"
     "$STAGE_DIR/bin/bh"
 )
 manager_destinations=(
     "$PROJECT_DIR/lib/common.sh"
     "$PROJECT_DIR/bin/backhaul-manager"
     "$PROJECT_DIR/bin/backhaul-menu"
+    "$PROJECT_DIR/bin/homa"
     "$PROJECT_DIR/bin/bh"
     "$MANAGER_BIN"
     "$MENU_BIN"
     "$SHORTCUT_BIN"
+    "$LEGACY_SHORTCUT_BIN"
 )
-manager_modes=(644 755 755 755 755 755 755)
+manager_modes=(644 755 755 755 755 755 755 755 755)
 manager_previous=()
 ROLLBACK_DIR="$TEMP_DIR/manager-rollback"
 install -d -m 700 "$ROLLBACK_DIR"
@@ -296,4 +306,5 @@ if ((${#FORWARD_ARGS[@]} > 0)); then
     exec "$MANAGER_BIN" "${FORWARD_ARGS[@]}"
 fi
 
-printf 'Run menu: sudo bh\n'
+printf 'Run menu: sudo homa\n'
+printf '[INFO] Legacy alias preserved: sudo bh\n'

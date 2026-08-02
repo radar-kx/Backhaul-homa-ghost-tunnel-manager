@@ -48,7 +48,7 @@ ss -lntp | grep -E ':(8090|8091|8092)[[:space:]]'
 `api.github.com` و `github.com` درست است. برای آخرین نسخه رسمی دوباره اجرا کنید:
 
 ```bash
-sudo bh binary install --latest
+sudo homa binary install --latest
 ```
 
 گزینه `--allow-unverified-download` فقط یک عبور صریح از کنترل Hash است و برای
@@ -75,4 +75,3 @@ Scrollback نشود. در Termius یا MobaXterm اندازه Font را طوری
 تغییر می‌کنند. همچنین خروجی وضعیت، Health Check و بکاپ پس از Enter درجا پاک
 می‌شود و نباید بالای منوی جدید باقی بماند. تاریخچه قبل از اجرای `bh` عمداً حفظ
 می‌شود.
-

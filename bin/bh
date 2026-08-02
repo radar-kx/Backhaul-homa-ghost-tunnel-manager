@@ -1,8 +1,6 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-if (($# == 0)); then
-    exec "${BH_MENU_BIN:-/usr/local/sbin/backhaul-menu}"
-fi
-
-exec "${BH_MANAGER_BIN:-/usr/local/sbin/backhaul-manager}" "$@"
+# Backward-compatible alias. New documentation and installer messages use homa.
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+exec "${BH_HOMA_BIN:-$SCRIPT_DIR/homa}" "$@"

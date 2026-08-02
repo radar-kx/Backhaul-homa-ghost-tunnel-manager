@@ -4,7 +4,7 @@
 [Backhaul](https://github.com/Musixal/Backhaul) روی Ubuntu و Debian.
 
 این پروژه برای معماری «ایران به‌عنوان ورودی و سرورهای خارج به‌عنوان خروجی» طراحی
-شده است. نسخه `1.1.11` علاوه بر نصب تونل جدید، سرویس‌های Backhaul از قبل نصب‌شده
+شده است. نسخه `1.1.13` علاوه بر نصب تونل جدید، سرویس‌های Backhaul از قبل نصب‌شده
 را نیز بدون تغییر کانفیگ شناسایی و مدیریت می‌کند.
 
 ## منوی انگلیسی سازگار با ترمینال موبایل
@@ -12,15 +12,12 @@
 پس از نصب فقط اجرا کنید:
 
 ```bash
-sudo bh
+sudo homa
 ```
 
-منو در بافر عادی ترمینال اجرا می‌شود. پیش از رسم منو، صفحه فعلی با Line Feed
-به Scrollback منتقل می‌شود؛ در نتیجه هنگام بازبودن `bh` نیز می‌توان در Termius
-با کشیدن صفحه، دستورها و خروجی‌های قبل از اجرای آن را دید. صفحه‌های موقت مانند
-وضعیت تونل و فهرست بکاپ پس از فشردن Enter درجا پاک می‌شوند و دیگر به تاریخچه
-منو منتقل نمی‌شوند. جابه‌جایی بین صفحات و Exit هرگز از دستور پاک‌کردن کامل
-Scrollback استفاده نمی‌کند.
+کل رابط داخل Alternate Screen اجرا می‌شود؛ بنابراین صفحه‌های Status، Logs،
+Diagnostics و Backup پس از بازگشت کاملاً حذف می‌شوند و با خروج از `homa`، صفحه
+و Scrollback قبلی شِل بدون بقایای منو برمی‌گردد. `bh` فقط Alias سازگاری است.
 
 گزینه‌ها با کلیدهای `Up` و `Down` جابه‌جا و با `Enter` انتخاب می‌شوند. برای
 سازگاری با روش قبلی، نوشتن شماره گزینه و سپس `Enter` نیز پشتیبانی می‌شود.
@@ -65,6 +62,10 @@ Scrollback استفاده نمی‌کند.
 - بررسی پایداری سرویس پس از Update و بازگردانی باینری قبلی در صورت Crash
 - حذف امن Manager بدون قطع تونل‌ها
 - تست خودکار منوها در PTY واقعی؛ CI نیز Bash Syntax و ShellCheck را اجرا می‌کند
+- خلاصه موبایلی وضعیت شامل Active/Enabled، Uptime، PID، RAM/CPU، مقصد و اتصال‌ها
+- Live Logs با ۲۰ خط آخر، زمان/سطح لاگ و بازگشت مستقیم با `Ctrl+C`
+- Port Monitor با وضعیت Listener/Remote، پردازش، اتصال‌ها، سرعت و شمارنده ترافیک
+- صفحه‌بندی خروجی‌های طولانی و حفظ مسیر بازگشت هر نتیجه به زیرمنوی والد
 
 ## نصب روی سروری که Backhaul فعال دارد
 
@@ -112,7 +113,7 @@ sudo backhaul-manager cron install --interval 5
 برای فعال‌کردن صریح تمام سرویس‌های `disabled` در یک بررسی دستی:
 
 ```bash
-sudo bh health --repair --enable-disabled
+sudo homa health --repair --enable-disabled
 ```
 
 
@@ -121,7 +122,7 @@ sudo bh health --repair --enable-disabled
 برای دریافت آخرین Release رسمی و بررسی SHA-256 منتشرشده برای Asset:
 
 ```bash
-sudo bh binary install --latest
+sudo homa binary install --latest
 ```
 
 Manager پس از جایگزینی باینری، سرویس‌هایی را که قبلاً فعال بوده‌اند چند مرحله
@@ -133,7 +134,7 @@ Manager پس از جایگزینی باینری، سرویس‌هایی را ک�
 نمی‌شود مگر اینکه فایل را از مسیر دیگری اعتبارسنجی کرده باشید:
 
 ```bash
-sudo bh binary install --latest --allow-unverified-download
+sudo homa binary install --latest --allow-unverified-download
 ```
 
 ## بازیابی بکاپ
@@ -144,8 +145,8 @@ Symlink، فایل تکراری، Metadata ناشناخته، فایل بدون 
 استخراج بررسی می‌کند و سپس فایل‌ها و وضعیت سرویس‌ها را تراکنشی بازمی‌گرداند.
 
 ```bash
-sudo bh backup list
-sudo bh backup restore /var/backups/backhaul-manager/BACKUP.tar.gz --yes
+sudo homa backup list
+sudo homa backup restore /var/backups/backhaul-manager/BACKUP.tar.gz --yes
 ```
 
 ## معماری نمونه
@@ -159,42 +160,42 @@ sudo bh backup restore /var/backups/backhaul-manager/BACKUP.tar.gz --yes
 
 ```bash
 # بازکردن منوی انگلیسی
-sudo bh
+sudo homa
 
 # فهرست تمام سرویس‌ها
-sudo bh list
+sudo homa list
 
 # بررسی و ترمیم
-sudo bh health --repair
+sudo homa health --repair
 
 # وضعیت Cron
-sudo bh cron status
+sudo homa cron status
 
 # بکاپ و بازیابی
-sudo bh backup create
-sudo bh backup list
-sudo bh backup restore /var/backups/backhaul-manager/backhaul-backup-....tar.gz --yes
+sudo homa backup create
+sudo homa backup list
+sudo homa backup restore /var/backups/backhaul-manager/backhaul-backup-....tar.gz --yes
 
 # نصب آخرین نسخه رسمی هسته همراه با بررسی Digest
-sudo bh binary install --latest
+sudo homa binary install --latest
 
 # نگاشت‌های یک Server
-sudo bh mapping list backhaul-tr-server.service
-sudo bh mapping add backhaul-tr-server.service 8303=127.0.0.1:8093
-sudo bh mapping remove backhaul-tr-server.service 8303
+sudo homa mapping list backhaul-tr-server.service
+sudo homa mapping add backhaul-tr-server.service 8303=127.0.0.1:8093
+sudo homa mapping remove backhaul-tr-server.service 8303
 
 # لاگ و Restart
-sudo bh logs backhaul-tr-client.service
-sudo bh restart backhaul-tr-client.service
+sudo homa logs backhaul-tr-client.service
+sudo homa restart backhaul-tr-client.service
 
 # عیب‌یابی کامل
-sudo bh doctor
+sudo homa doctor
 ```
 
 ## ساخت Server
 
 ```bash
-sudo bh server add \
+sudo homa server add \
   --name tr \
   --bind 0.0.0.0:9300 \
   --public-host 203.0.113.10 \
@@ -211,7 +212,7 @@ sudo bh server add \
 ## ساخت Client
 
 ```bash
-sudo bh client add \
+sudo homa client add \
   --name tr \
   --remote 203.0.113.10:9300 \
   --transport wsmux \
@@ -229,7 +230,8 @@ sudo bh client add \
 | مسیر | کاربرد |
 |---|---|
 | `/usr/local/bin/backhaul` | هسته Backhaul |
-| `/usr/local/bin/bh` | فرمان کوتاه منو و CLI |
+| `/usr/local/bin/homa` | فرمان اصلی منو و CLI |
+| `/usr/local/bin/bh` | Alias قدیمی برای سازگاری |
 | `/usr/local/sbin/backhaul-manager` | ابزار خط فرمان |
 | `/usr/local/sbin/backhaul-menu` | منوی انگلیسی |
 | `/opt/backhaul-tunnel-manager` | فایل‌های Manager |

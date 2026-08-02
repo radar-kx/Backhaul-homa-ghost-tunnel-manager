@@ -26,15 +26,15 @@ bash <(curl -fsSL --ipv4 \
 بعد:
 
 ```bash
-sudo bh list
-sudo bh health
-sudo bh cron status
+sudo homa list
+sudo homa health
+sudo homa cron status
 ```
 
 همه سرویس‌ها باید `enabled` و `active` باشند. سپس منو:
 
 ```bash
-sudo bh
+sudo homa
 ```
 
 ## کنترل بعد از نصب
@@ -64,9 +64,9 @@ control channel established successfully
 ابتدا روی یک Client کم‌ریسک اجرا کنید:
 
 ```bash
-sudo bh backup create
-sudo bh binary install --latest
-sudo bh health
+sudo homa backup create
+sudo homa binary install --latest
+sudo homa health
 ```
 
 Manager Digest رسمی Asset را بررسی می‌کند و فقط سرویس‌هایی را که پیش از Update
@@ -76,15 +76,15 @@ Manager Digest رسمی Asset را بررسی می‌کند و فقط سرویس
 ## بازیابی بکاپ
 
 ```bash
-sudo bh backup list
-sudo bh backup restore /var/backups/backhaul-manager/BACKUP.tar.gz --yes
+sudo homa backup list
+sudo homa backup restore /var/backups/backhaul-manager/BACKUP.tar.gz --yes
 ```
 
 Restore پیش از تغییر فایل‌ها یک Safety Backup می‌سازد. پس از بازیابی، وضعیت و
 لاگ همه تونل‌ها را کنترل کنید:
 
 ```bash
-sudo bh list
-sudo bh health
+sudo homa list
+sudo homa health
 sudo journalctl -u backhaul-NAME-client.service -n 100 --no-pager
 ```

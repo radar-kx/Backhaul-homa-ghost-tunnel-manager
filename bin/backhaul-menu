@@ -13,7 +13,7 @@ else
     source "$SCRIPT_DIR/../lib/common.sh"
 fi
 
-BH_NORMAL_SCREEN_ACTIVE=0
+BH_ALTERNATE_SCREEN_ACTIVE=0
 BH_TERMINAL_RESTORED=0
 BH_STTY_ACTIVE=0
 BH_STTY_SAVED=""
@@ -161,18 +161,10 @@ terminal_enter() {
 
     BH_TERM_ROWS="$(terminal_row_count)"
     BH_TERM_COLUMNS="$(terminal_column_count)"
-    BH_NORMAL_SCREEN_ACTIVE=1
-
-    # Stay in the terminal's normal buffer so Termius touch scrolling can
-    # still reach commands and output from before `bh`. Preserve only the
-    # occupied rows above the current cursor; never manufacture a full blank
-    # page and never emit CSI 3 J (erase scrollback).
-    if ! archive_current_view; then
-        # A terminal without cursor-position reporting cannot be archived
-        # precisely. Prefer a clean normal-buffer viewport over inserting a
-        # guessed number of blank lines into the user's history.
-        printf '\033[H'
-    fi
+    # The entire interface lives in the alternate buffer. Returning from homa
+    # restores the user's shell exactly as it was before the menu opened.
+    printf '\033[?1049h\033[2J\033[H'
+    BH_ALTERNATE_SCREEN_ACTIVE=1
 }
 
 terminal_leave() {
@@ -181,9 +173,9 @@ terminal_leave() {
     terminal_input_end
     printf '%s' "$BH_RESET"
 
-    if ((BH_NORMAL_SCREEN_ACTIVE == 1)) && is_terminal; then
-        clear_screen
-        BH_NORMAL_SCREEN_ACTIVE=0
+    if ((BH_ALTERNATE_SCREEN_ACTIVE == 1)) && is_terminal; then
+        printf '\033[2J\033[H\033[?1049l'
+        BH_ALTERNATE_SCREEN_ACTIVE=0
     fi
 }
 
@@ -202,7 +194,7 @@ pause_menu() {
     # the normal buffer's scrollback when returning to a menu; Termius would
     # otherwise show every previous status and backup page above the current
     # HOMA frame. The shell history from before `bh` remains untouched.
-    if ((BH_NORMAL_SCREEN_ACTIVE == 1)) && is_terminal; then
+    if ((BH_ALTERNATE_SCREEN_ACTIVE == 1)) && is_terminal; then
         clear_screen
     fi
 }
@@ -221,7 +213,7 @@ finish_menu_frame() {
     # normal buffer's history. Erase the current menu in place before its
     # caller prints a submenu or command output. Write the control sequence to
     # stderr because select_unit is used inside command substitution.
-    if ((BH_NORMAL_SCREEN_ACTIVE == 1)) && is_terminal; then
+    if ((BH_ALTERNATE_SCREEN_ACTIVE == 1)) && is_terminal; then
         printf '\033[2J\033[H' >&2
     else
         printf '\n' >&2
@@ -367,22 +359,43 @@ menu_select() {
     fi
 
     local selected_index=0
-    local previous_selected_index=0
+    local rendered_selected_index=0
     local typed_number=""
-    local previous_typed_number=""
+    local rendered_typed_number=""
     local key="" sequence="" suffix=""
     local read_status=0
     local escape_index=0
     local entry_count="${#entries[@]}"
+    local needs_prompt=0
     terminal_input_begin || return 1
     render_menu_choices "$selected_index" "$typed_number" "$prompt" \
         "${entries[@]}"
 
     while true; do
         key=""
-        IFS= read -rsN1 -t 1 key
+        # A short quiet window coalesces key-repeat bursts. Only the final
+        # selection is painted, avoiding a full redraw for every queued arrow.
+        IFS= read -rsN1 -t 0.03 key
         read_status=$?
         if ((read_status > 128)); then
+            needs_prompt=0
+            if ((selected_index != rendered_selected_index)); then
+                redraw_menu_choice_at \
+                    "$rendered_selected_index" 0 "$entry_count" \
+                    "${entries[$rendered_selected_index]}"
+                redraw_menu_choice_at \
+                    "$selected_index" 1 "$entry_count" \
+                    "${entries[$selected_index]}"
+                rendered_selected_index="$selected_index"
+                needs_prompt=1
+            fi
+            if [[ "$typed_number" != "$rendered_typed_number" ]]; then
+                rendered_typed_number="$typed_number"
+                needs_prompt=1
+            fi
+            if ((needs_prompt == 1)); then
+                render_menu_prompt "$typed_number" "$prompt"
+            fi
             continue
         fi
         if ((read_status != 0)); then
@@ -390,9 +403,6 @@ menu_select() {
             finish_menu_frame
             return 1
         fi
-
-        previous_selected_index="$selected_index"
-        previous_typed_number="$typed_number"
 
         case "$key" in
             ''|$'\n'|$'\r')
@@ -453,18 +463,6 @@ menu_select() {
                 ;;
         esac
 
-        if ((selected_index != previous_selected_index)); then
-            redraw_menu_choice_at \
-                "$previous_selected_index" 0 "$entry_count" \
-                "${entries[$previous_selected_index]}"
-            redraw_menu_choice_at \
-                "$selected_index" 1 "$entry_count" \
-                "${entries[$selected_index]}"
-        fi
-        if [[ "$typed_number" != "$previous_typed_number" ]] ||
-           ((selected_index != previous_selected_index)); then
-            render_menu_prompt "$typed_number" "$prompt"
-        fi
     done
 
     terminal_input_end
@@ -580,6 +578,138 @@ confirm() {
     [[ "$answer" == "y" || "$answer" == "Y" ]]
 }
 
+confirm_twice() {
+    local prompt="$1" answer=""
+    confirm "$prompt" || return 1
+    read -r -p "Type YES to confirm: " answer || return 1
+    [[ "$answer" == "YES" ]]
+}
+
+human_bytes() {
+    local value="${1:-0}"
+    [[ "$value" =~ ^[0-9]+$ ]] || value=0
+    awk -v bytes="$value" 'BEGIN {
+        split("B KiB MiB GiB TiB", unit, " "); i=1
+        while (bytes >= 1024 && i < 5) { bytes /= 1024; i++ }
+        printf (i == 1 ? "%.0f %s" : "%.1f %s"), bytes, unit[i]
+    }'
+}
+
+show_file_paged() {
+    local title="$1" file="$2"
+    local total page=0 page_size start end choice=""
+    total="$(wc -l <"$file")"
+    [[ "$total" =~ ^[0-9]+$ ]] || total=0
+    page_size=$(( $(terminal_row_count) - 6 ))
+    ((page_size >= 5)) || page_size=5
+
+    if ! is_terminal || ((total <= page_size)); then
+        cat -- "$file"
+        pause_menu || true
+        return 0
+    fi
+
+    while true; do
+        clear_screen
+        start=$((page * page_size + 1))
+        end=$((start + page_size - 1))
+        ((end <= total)) || end="$total"
+        printf '%s%s%s  [%d-%d / %d]\n\n' \
+            "$BH_CYAN" "$title" "$BH_RESET" "$start" "$end" "$total"
+        sed -n "${start},${end}p" "$file"
+        printf '\n'
+        menu_select choice "Page" \
+            "1|Next page" "2|Previous page" "0|Back" || return 0
+        case "$choice" in
+            1) ((end < total)) && page=$((page + 1)) ;;
+            2) ((page > 0)) && page=$((page - 1)) ;;
+            0) return 0 ;;
+        esac
+    done
+}
+
+capture_and_page() {
+    local title="$1"
+    shift
+    local output status=0
+    output="$(mktemp)"
+    "$@" >"$output" 2>&1 || status=$?
+    show_file_paged "$title" "$output"
+    rm -f -- "$output"
+    return "$status"
+}
+
+systemd_property() {
+    local unit="$1" property="$2"
+    if [[ "${BH_NO_SYSTEMD:-0}" == "1" ]]; then
+        printf 'test-mode\n'
+    else
+        systemctl show "$unit" --property "$property" --value 2>/dev/null |
+            awk 'NF { print; exit }'
+    fi
+}
+
+service_uptime() {
+    local unit="$1" entered now seconds days hours minutes
+    entered="$(systemd_property "$unit" ActiveEnterTimestampMonotonic)"
+    if [[ ! "$entered" =~ ^[0-9]+$ ]] || ((entered == 0)); then
+        printf 'unknown\n'
+        return 0
+    fi
+    now="$(awk '{printf "%.0f", $1*1000000}' /proc/uptime 2>/dev/null || true)"
+    [[ "$now" =~ ^[0-9]+$ ]] || { printf 'unknown\n'; return 0; }
+    seconds=$(( (now - entered) / 1000000 ))
+    ((seconds >= 0)) || seconds=0
+    days=$((seconds / 86400)); hours=$((seconds % 86400 / 3600))
+    minutes=$((seconds % 3600 / 60)); seconds=$((seconds % 60))
+    printf '%dd %02dh %02dm %02ds\n' "$days" "$hours" "$minutes" "$seconds"
+}
+
+config_endpoint() {
+    local unit="$1" config role endpoint=""
+    config="$(unit_config_path "$unit" 2>/dev/null || true)"
+    role="$(unit_role_from_config "$config")"
+    [[ -r "$config" ]] || { printf 'unknown\n'; return; }
+    if [[ "$role" == "client" ]]; then
+        endpoint="$(sed -nE 's/^[[:space:]]*remote_addr[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' "$config" | head -n1)"
+    else
+        endpoint="$(sed -nE 's/^[[:space:]]*bind_addr[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' "$config" | head -n1)"
+    fi
+    printf '%s\n' "${endpoint:-unknown}"
+}
+
+active_connection_count() {
+    local pid="$1"
+    [[ "$pid" =~ ^[1-9][0-9]*$ ]] || { printf '0\n'; return; }
+    if command -v ss >/dev/null 2>&1; then
+        ss -Hntp 2>/dev/null | grep -Fc "pid=$pid," || true
+    else
+        printf 'unknown\n'
+    fi
+}
+
+show_compact_status() {
+    local unit="$1" current startup pid uptime cpu ram endpoint connections
+    current="$(systemctl_state is-active "$unit")"
+    startup="$(systemctl_state is-enabled "$unit")"
+    pid="$(systemd_property "$unit" MainPID)"
+    [[ "$pid" =~ ^[1-9][0-9]*$ ]] || pid=0
+    uptime="$(service_uptime "$unit")"
+    cpu="$(ps -p "$pid" -o %cpu= 2>/dev/null | awk '{$1=$1; print}' || true)"
+    ram="$(ps -p "$pid" -o rss= 2>/dev/null | awk '{printf "%.1f MiB", $1/1024}' || true)"
+    endpoint="$(config_endpoint "$unit")"
+    connections="$(active_connection_count "$pid")"
+    printf 'Service: %s\n' "$unit"
+    printf 'Current: %s\n' "${current:-unknown}"
+    printf 'Boot: %s\n' "${startup:-unknown}"
+    printf 'Uptime: %s\n' "${uptime:-unknown}"
+    printf 'PID: %s\n' "$pid"
+    printf 'RAM: %s\n' "${ram:-0 MiB}"
+    printf 'CPU: %s%%\n' "${cpu:-0.0}"
+    printf 'Endpoint: %s\n' "$endpoint"
+    printf 'Active connections: %s\n' "$connections"
+}
+
 select_unit() {
     local prompt="${1:-Select a Backhaul service}"
     local -a units=()
@@ -625,8 +755,29 @@ follow_service_logs() {
     # Keep the menu alive when Ctrl+C stops journalctl. Child processes reset
     # caught traps to their default behavior, so journalctl still terminates.
     trap ':' INT
-    journalctl -u "$unit" -n 100 -f || true
+    if command -v python3 >/dev/null 2>&1; then
+        journalctl -u "$unit" -n 20 -f -o json 2>/dev/null |
+            python3 -u -c '
+import datetime, json, sys
+levels={0:"EMERG",1:"ALERT",2:"CRIT",3:"ERROR",4:"WARN",5:"NOTICE",6:"INFO",7:"DEBUG"}
+for raw in sys.stdin:
+    try:
+        item=json.loads(raw)
+        stamp=int(item.get("__REALTIME_TIMESTAMP", "0"))/1_000_000
+        when=datetime.datetime.fromtimestamp(stamp).astimezone().isoformat(timespec="seconds")
+        level=levels.get(int(item.get("PRIORITY", 6)), "INFO")
+        message=str(item.get("MESSAGE", "")).replace("\n", " ")
+        print(f"{when} [{level}] {message}", flush=True)
+    except Exception:
+        text=raw.strip()
+        if text:
+            print(text, flush=True)
+' || true
+    else
+        journalctl -u "$unit" -n 20 -f -o short-iso-precise || true
+    fi
     trap - INT
+    clear_screen
 }
 
 mapping_menu() {
@@ -635,7 +786,9 @@ mapping_menu() {
     config="$(unit_config_path "$unit" 2>/dev/null || true)"
     role="$(unit_role_from_config "$config")"
     if [[ "$role" != "server" ]]; then
-        warn "Port mappings are managed on the Iran server side."
+        warn "This tunnel is a Client and has no local Port Mapping table."
+        printf 'Mappings are defined on the matching Server and forward public ports\n'
+        printf 'to local services such as 8200=127.0.0.1:8090.\n'
         pause_menu || true
         return 0
     fi
@@ -677,24 +830,28 @@ tunnel_management() {
     while true; do
         clear_screen
         printf '%sTunnel management: %s%s\n\n' "$BH_CYAN" "$unit" "$BH_RESET"
+        printf 'Service: %s\n' "$(systemctl_state is-active "$unit")"
+        printf 'Boot: %s\n\n' "$(systemctl_state is-enabled "$unit")"
         menu_select choice "Selection" \
-            "1|Show status" \
+            "1|Show mobile status summary" \
             "2|Show live logs" \
             "3|Restart" \
             "4|Start, stop, and boot settings" \
             "5|Manage port mappings" \
             "6|Show config with token redacted" \
             "7|Move tunnel to a recoverable archive" \
+            "8|Show full systemd details" \
+            "9|Port Monitor" \
             "0|Back" || return 0
         case "$choice" in
-            1) "$BH_MANAGER_BIN" status "$unit"; pause_menu ;;
+            1) show_compact_status "$unit"; pause_menu ;;
             2)
-                printf 'Press Ctrl+C to stop live logs.\n'
+                printf 'Last 20 lines are shown once; then only new logs are followed.\n'
+                printf 'Press Ctrl+C to return directly to Tunnel management.\n\n'
                 follow_service_logs "$unit"
-                pause_menu
                 ;;
             3)
-                confirm "Restart service $unit?" &&
+                confirm_twice "Restart service $unit?" &&
                     "$BH_MANAGER_BIN" restart "$unit"
                 pause_menu
                 ;;
@@ -705,12 +862,14 @@ tunnel_management() {
                 pause_menu
                 ;;
             7)
-                if confirm "Stop this tunnel and move it to a recoverable archive?"; then
+                if confirm_twice "Stop this tunnel and move it to a recoverable archive?"; then
                     "$BH_MANAGER_BIN" retire "$unit" --yes
                     pause_menu
                     return 0
                 fi
                 ;;
+            8) capture_and_page "Full service details" systemctl --no-pager --full status "$unit" || true ;;
+            9) port_monitor "$unit" ;;
             0) return 0 ;;
             *) warn "Invalid selection."; pause_menu ;;
         esac
@@ -736,12 +895,13 @@ service_controls_for_unit() {
             pause_menu || true
             ;;
         2)
-            confirm "Stopping $unit will interrupt its tunnel. Continue?" || return 0
+            confirm_twice "Stopping $unit will interrupt its tunnel. Continue?" || return 0
             systemctl stop "$unit"
             systemctl is-active "$unit" || true
             pause_menu || true
             ;;
         3)
+            confirm_twice "Restart $unit now?" || return 0
             systemctl restart "$unit"
             systemctl is-active "$unit"
             pause_menu || true
@@ -752,7 +912,7 @@ service_controls_for_unit() {
             pause_menu || true
             ;;
         5)
-            confirm "Disable automatic startup for $unit after reboot?" || return 0
+            confirm_twice "Disable automatic startup for $unit after reboot?" || return 0
             systemctl disable "$unit"
             systemctl is-enabled "$unit" || true
             pause_menu || true
@@ -776,48 +936,50 @@ show_redacted_config() {
 }
 
 health_menu() {
-    clear_screen
     local choice=""
-    printf '%sHealth check and auto-repair%s\n\n' "$BH_CYAN" "$BH_RESET"
-    menu_select choice "Selection" \
-        "1|Check only" \
-        "2|Check and auto-repair" \
-        "0|Back" || return 0
-    case "$choice" in
-        1) "$BH_MANAGER_BIN" health; pause_menu || true ;;
-        2) "$BH_MANAGER_BIN" health --repair; pause_menu || true ;;
-        0) return 0 ;;
-        *) warn "Invalid selection."; pause_menu || true ;;
-    esac
+    while true; do
+        clear_screen
+        printf '%sHealth check and auto-repair%s\n\n' "$BH_CYAN" "$BH_RESET"
+        menu_select choice "Selection" \
+            "1|Check only" \
+            "2|Check and auto-repair" \
+            "0|Back" || return 0
+        case "$choice" in
+            1) "$BH_MANAGER_BIN" health; pause_menu || true ;;
+            2) "$BH_MANAGER_BIN" health --repair; pause_menu || true ;;
+            0) return 0 ;;
+            *) warn "Invalid selection."; pause_menu || true ;;
+        esac
+    done
 }
 
 cron_menu() {
-    clear_screen
     local choice="" interval=""
-    printf '%sHealth-check cron%s\n\n' "$BH_CYAN" "$BH_RESET"
-    menu_select choice "Selection" \
-        "1|Show health cron status" \
-        "2|Enable every 5 minutes" \
-        "3|Set a custom interval" \
-        "4|Remove health cron" \
-        "0|Back" || return 0
-    case "$choice" in
-        1) "$BH_MANAGER_BIN" cron status; pause_menu || true ;;
-        2) "$BH_MANAGER_BIN" cron install --interval 5; pause_menu || true ;;
-        3)
-            read -r -p "Check interval (1 to 59 minutes): " interval ||
-                return 0
-            "$BH_MANAGER_BIN" cron install --interval "$interval"
-            pause_menu || true
-            ;;
-        4)
-            confirm "Remove the health-check cron job?" &&
-                "$BH_MANAGER_BIN" cron remove
-            pause_menu || true
-            ;;
-        0) return 0 ;;
-        *) warn "Invalid selection."; pause_menu || true ;;
-    esac
+    while true; do
+        clear_screen
+        printf '%sHealth-check cron%s\n\n' "$BH_CYAN" "$BH_RESET"
+        menu_select choice "Selection" \
+            "1|Show health cron status" \
+            "2|Enable every 5 minutes" \
+            "3|Set a custom interval" \
+            "4|Remove health cron" \
+            "0|Back" || return 0
+        case "$choice" in
+            1) "$BH_MANAGER_BIN" cron status; pause_menu || true ;;
+            2) "$BH_MANAGER_BIN" cron install --interval 5; pause_menu || true ;;
+            3)
+                read -r -p "Check interval (1 to 59 minutes): " interval || continue
+                "$BH_MANAGER_BIN" cron install --interval "$interval"
+                pause_menu || true
+                ;;
+            4)
+                confirm "Remove the health-check cron job?" && "$BH_MANAGER_BIN" cron remove
+                pause_menu || true
+                ;;
+            0) return 0 ;;
+            *) warn "Invalid selection."; pause_menu || true ;;
+        esac
+    done
 }
 
 select_backup_archive() {
@@ -848,29 +1010,33 @@ select_backup_archive() {
 }
 
 backup_menu() {
-    clear_screen
-    local choice="" archive=""
-    printf '%sBackups and restore%s\n\n' "$BH_CYAN" "$BH_RESET"
-    menu_select choice "Selection" \
-        "1|Create a new backup" \
-        "2|List backups" \
-        "3|Restore a backup" \
-        "0|Back" || return 0
-    case "$choice" in
-        1) "$BH_MANAGER_BIN" backup create; pause_menu || true ;;
-        2) "$BH_MANAGER_BIN" backup list; pause_menu || true ;;
-        3)
-            select_backup_archive archive || return 0
-            printf 'Restore replaces matching configs and service files.\n'
-            printf 'A safety backup is created automatically before any change.\n'
-            if confirm "Restore $(basename "$archive")?"; then
-                "$BH_MANAGER_BIN" backup restore "$archive" --yes
-            fi
-            pause_menu || true
-            ;;
-        0) return 0 ;;
-        *) warn "Invalid selection."; pause_menu || true ;;
-    esac
+    local choice="" archive="" restore_word=""
+    while true; do
+        clear_screen
+        printf '%sBackups and restore%s\n\n' "$BH_CYAN" "$BH_RESET"
+        menu_select choice "Selection" \
+            "1|Create a new backup" \
+            "2|List backups" \
+            "3|Restore a backup" \
+            "0|Back" || return 0
+        case "$choice" in
+            1) capture_and_page "Backup result" "$BH_MANAGER_BIN" backup create || true ;;
+            2) capture_and_page "Available backups" "$BH_MANAGER_BIN" backup list || true ;;
+            3)
+                select_backup_archive archive || continue
+                printf 'Restore replaces matching configs and service files.\n'
+                printf 'A safety backup and automatic rollback are enabled.\n'
+                read -r -p "Type RESTORE to continue: " restore_word || continue
+                [[ "$restore_word" == "RESTORE" ]] || { warn "Restore cancelled."; pause_menu || true; continue; }
+                if confirm_twice "Restore $(basename "$archive")?"; then
+                    capture_and_page "Restore / rollback result" \
+                        "$BH_MANAGER_BIN" backup restore "$archive" --yes || true
+                fi
+                ;;
+            0) return 0 ;;
+            *) warn "Invalid selection."; pause_menu || true ;;
+        esac
+    done
 }
 
 add_server_interactive() {
@@ -920,101 +1086,227 @@ add_client_interactive() {
 }
 
 configure_tunnel() {
-    clear_screen
     local choice=""
-    printf '%sCreate a new tunnel%s\n\n' "$BH_CYAN" "$BH_RESET"
-    menu_select choice "Selection" \
-        "1|${BH_GREEN}Configure the Iran entry server (Server)${BH_RESET}" \
-        "2|${BH_CYAN}Configure a foreign exit server (Client)${BH_RESET}" \
-        "0|Back" || return 0
-    case "$choice" in
-        1) add_server_interactive; pause_menu || true ;;
-        2) add_client_interactive; pause_menu || true ;;
-        0) return 0 ;;
-        *) warn "Invalid selection."; pause_menu || true ;;
-    esac
+    while true; do
+        clear_screen
+        printf '%sCreate a new tunnel%s\n\n' "$BH_CYAN" "$BH_RESET"
+        menu_select choice "Selection" \
+            "1|${BH_GREEN}Configure the Iran entry server (Server)${BH_RESET}" \
+            "2|${BH_CYAN}Configure a foreign exit server (Client)${BH_RESET}" \
+            "0|Back" || return 0
+        case "$choice" in
+            1) add_server_interactive; pause_menu || true ;;
+            2) add_client_interactive; pause_menu || true ;;
+            0) return 0 ;;
+            *) warn "Invalid selection."; pause_menu || true ;;
+        esac
+    done
+}
+
+show_listening_summary() {
+    local rows
+    command -v ss >/dev/null 2>&1 || { warn "The ss command is not installed."; return 1; }
+    rows="$(ss -Hlntp 2>/dev/null | grep -F 'backhaul' || true)"
+    if [[ -z "$rows" ]]; then
+        printf 'Listening port: none\n'
+        printf 'Client note: a Client normally has no Backhaul listening port.\n'
+        return 0
+    fi
+    printf '%s\n' "$rows" | awk '{
+        process="backhaul"; local_addr=$4
+        print "Local: " local_addr
+        print "State: Listening"
+        print "Process: " process "\n"
+    }'
+}
+
+show_connection_summary() {
+    local rows
+    command -v ss >/dev/null 2>&1 || { warn "The ss command is not installed."; return 1; }
+    rows="$(ss -Hntp 2>/dev/null | grep -F 'backhaul' || true)"
+    if [[ -z "$rows" ]]; then
+        printf 'State: Disconnected\nActive connections: 0\nProcess: backhaul\n'
+        return 0
+    fi
+    printf '%s\n' "$rows" | awk '
+        { count[$5]++; state[$5]=$1 }
+        END {
+            for (remote in count) {
+                print "Remote: " remote
+                print "State: " (state[remote] == "ESTAB" ? "Connected" : state[remote])
+                print "Active connections: " count[remote]
+                print "Process: backhaul\n"
+            }
+        }'
+}
+
+socket_totals_for_pid() {
+    local pid="$1"
+    command -v ss >/dev/null 2>&1 || { printf '0 0\n'; return; }
+    ss -Htinp 2>/dev/null | awk -v wanted="pid=$pid," '
+        index($0, wanted) { matched=1; next }
+        matched {
+            sent=received=0
+            if (match($0, /bytes_acked:[0-9]+/)) {
+                sent=substr($0, RSTART, RLENGTH); sub(/^bytes_acked:/, "", sent)
+            }
+            if (match($0, /bytes_received:[0-9]+/)) {
+                received=substr($0, RSTART, RLENGTH); sub(/^bytes_received:/, "", received)
+            }
+            tx+=sent; rx+=received; matched=0
+        }
+        END { printf "%.0f %.0f\n", rx, tx }'
+}
+
+configured_ports() {
+    local config="$1"
+    [[ -r "$config" ]] || return 0
+    sed -nE '
+        s/^[[:space:]]*(bind_addr|remote_addr)[[:space:]]*=[[:space:]]*".*:([0-9]+)".*/\2/p
+        s/^[[:space:]]*"?([0-9]+)=.*/\1/p
+    ' "$config" | sort -nu
+}
+
+port_monitor_snapshot() {
+    local unit="$1" previous_rx="$2" previous_tx="$3" elapsed="$4" base_rx="$5" base_tx="$6"
+    local pid role config endpoint current_rx current_tx down up connections port port_connections
+    local ingress egress
+    pid="$(systemd_property "$unit" MainPID)"
+    [[ "$pid" =~ ^[1-9][0-9]*$ ]] || pid=0
+    config="$(unit_config_path "$unit" 2>/dev/null || true)"
+    role="$(unit_role_from_config "$config")"
+    endpoint="$(config_endpoint "$unit")"
+    read -r current_rx current_tx < <(socket_totals_for_pid "$pid")
+    [[ "$elapsed" =~ ^[1-9][0-9]*$ ]] || elapsed=1
+    down=$(( current_rx >= previous_rx ? (current_rx - previous_rx) / elapsed : 0 ))
+    up=$(( current_tx >= previous_tx ? (current_tx - previous_tx) / elapsed : 0 ))
+    connections="$(active_connection_count "$pid")"
+
+    printf '\033[2KPort Monitor: %s\n' "$unit"
+    printf '\033[2KRole: %s | PID: %s | Process: backhaul\n' "$role" "$pid"
+    printf '\033[2KEndpoint: %s\n' "$endpoint"
+    if [[ "$role" == "server" ]]; then
+        if ss -Hlntp 2>/dev/null | grep -Fq "pid=$pid,"; then
+            printf '\033[2KLocal listener: OPEN\n'
+        else
+            printf '\033[2K[ALERT] Local listener is DOWN\n'
+        fi
+    else
+        printf '\033[2KLocal listener: N/A (Client)\n'
+    fi
+    if [[ "$connections" =~ ^[0-9]+$ ]] && ((connections > 0)); then
+        printf '\033[2KRemote connection: CONNECTED\n'
+    else
+        printf '\033[2K[ALERT] Remote connection is DOWN\n'
+    fi
+    printf '\033[2KActive connections: %s\n' "$connections"
+    while IFS= read -r port; do
+        [[ -n "$port" ]] || continue
+        port_connections="$(ss -Hntp 2>/dev/null | awk -v p=":$port" '$4 ~ p"$" || $5 ~ p"$" {n++} END {print n+0}')"
+        if ss -Hlntp 2>/dev/null | awk -v p=":$port" '$4 ~ p"$" {found=1} END {exit !found}'; then
+            printf '\033[2KPort %s: OPEN | Process: backhaul | Connections: %s\n' "$port" "$port_connections"
+        elif [[ "$role" == "client" && "$port" == "${endpoint##*:}" ]]; then
+            printf '\033[2KPort %s: REMOTE | Process: backhaul | Connections: %s\n' "$port" "$port_connections"
+        else
+            printf '\033[2KPort %s: CLOSED | Process: none | Connections: %s\n' "$port" "$port_connections"
+        fi
+    done < <(configured_ports "$config")
+    printf '\033[2KDownload: %s/s | Upload: %s/s\n' \
+        "$(human_bytes "$down")" "$(human_bytes "$up")"
+    ingress="$(systemd_property "$unit" IPIngressBytes)"
+    egress="$(systemd_property "$unit" IPEgressBytes)"
+    [[ "$ingress" =~ ^[0-9]+$ ]] || ingress="$current_rx"
+    [[ "$egress" =~ ^[0-9]+$ ]] || egress="$current_tx"
+    printf '\033[2KTotal received/sent: %s / %s\n' "$(human_bytes "$ingress")" "$(human_bytes "$egress")"
+    printf '\033[2KToday observed: %s / %s\n' \
+        "$(human_bytes "$((current_rx >= base_rx ? current_rx - base_rx : 0))")" \
+        "$(human_bytes "$((current_tx >= base_tx ? current_tx - base_tx : 0))")"
+    printf '\033[2KSince service start: %s / %s\n' "$(human_bytes "$ingress")" "$(human_bytes "$egress")"
+    printf '\033[2KPress R to refresh now or Q to return.\n'
+    printf '%s %s\n' "$current_rx" "$current_tx"
+}
+
+port_monitor() {
+    local unit="$1" pid rx=0 tx=0 base_rx=0 base_tx=0 new_rx=0 new_tx=0 key="" snapshot
+    pid="$(systemd_property "$unit" MainPID)"
+    read -r rx tx < <(socket_totals_for_pid "${pid:-0}")
+    base_rx="$rx"
+    base_tx="$tx"
+    clear_screen
+    while true; do
+        # Refresh the existing frame in place; do not clear the full screen on
+        # every sample because mobile terminals visibly flash on rapid clears.
+        printf '\033[H'
+        snapshot="$(port_monitor_snapshot "$unit" "$rx" "$tx" 1 "$base_rx" "$base_tx")"
+        new_rx="$(printf '%s\n' "$snapshot" | tail -n1 | awk '{print $1}')"
+        new_tx="$(printf '%s\n' "$snapshot" | tail -n1 | awk '{print $2}')"
+        printf '%s\n' "$(printf '%s\n' "$snapshot" | sed '$d')"
+        printf '\033[J'
+        key=""
+        IFS= read -rsN1 -t 1 key || true
+        case "$key" in q|Q|$'\e') return 0 ;; esac
+        rx="${new_rx:-$rx}"
+        tx="${new_tx:-$tx}"
+    done
 }
 
 network_tools() {
-    clear_screen
-    local choice=""
-    printf '%sNetwork diagnostics%s\n\n' "$BH_CYAN" "$BH_RESET"
-    menu_select choice "Selection" \
-        "1|Run full Backhaul diagnostics" \
-        "2|Show listening ports" \
-        "3|Show active Backhaul connections" \
-        "4|Show important network settings (read-only)" \
-        "0|Back" || return 0
-    case "$choice" in
-        1) "$BH_MANAGER_BIN" doctor ;;
-        2)
-            if ! command -v ss >/dev/null 2>&1; then
-                warn "The ss command is not installed."
-                pause_menu || true
-                return 0
-            fi
-            local listening
-            listening="$(ss -H -lntp 2>/dev/null | grep -F 'backhaul' || true)"
-            if [[ -n "$listening" ]]; then
-                printf '%s\n' "$listening"
-            else
-                printf 'No local Backhaul listening port was found.\n'
-                printf 'This is normal on a Client that connects to the Iran server.\n'
-            fi
-            ;;
-        3)
-            if ! command -v ss >/dev/null 2>&1; then
-                warn "The ss command is not installed."
-                pause_menu || true
-                return 0
-            fi
-            local connections
-            connections="$(ss -H -ntp 2>/dev/null | grep -F 'backhaul' || true)"
-            if [[ -n "$connections" ]]; then
-                printf '%s\n' "$connections"
-            else
-                printf 'No active Backhaul TCP connection was found.\n'
-            fi
-            ;;
-        4)
-            printf 'qdisc: '
-            sysctl -n net.core.default_qdisc 2>/dev/null || printf 'unknown\n'
-            printf 'congestion_control: '
-            sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || printf 'unknown\n'
-            printf 'rmem_max: '
-            sysctl -n net.core.rmem_max 2>/dev/null || printf 'unknown\n'
-            printf 'wmem_max: '
-            sysctl -n net.core.wmem_max 2>/dev/null || printf 'unknown\n'
-            printf '\nNo settings were changed by this option.\n'
-            ;;
-        0) return 0 ;;
-        *) warn "Invalid selection." ;;
-    esac
-    pause_menu || true
+    local choice="" settings_file
+    while true; do
+        clear_screen
+        printf '%sNetwork diagnostics%s\n\n' "$BH_CYAN" "$BH_RESET"
+        menu_select choice "Selection" \
+            "1|Run full Backhaul diagnostics" \
+            "2|Show listening ports (summary)" \
+            "3|Show active connections (summary)" \
+            "4|Show important network settings (read-only)" \
+            "0|Back" || return 0
+        case "$choice" in
+            1) capture_and_page "Backhaul diagnostics" "$BH_MANAGER_BIN" doctor || true ;;
+            2) capture_and_page "Listening ports" show_listening_summary || true ;;
+            3) capture_and_page "Active connections" show_connection_summary || true ;;
+            4)
+                settings_file="$(mktemp)"
+                {
+                    printf 'qdisc: '; sysctl -n net.core.default_qdisc 2>/dev/null || printf 'unknown\n'
+                    printf 'congestion_control: '; sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || printf 'unknown\n'
+                    printf 'rmem_max: '; sysctl -n net.core.rmem_max 2>/dev/null || printf 'unknown\n'
+                    printf 'wmem_max: '; sysctl -n net.core.wmem_max 2>/dev/null || printf 'unknown\n'
+                    printf '\nRead-only: no setting was changed.\n'
+                } >"$settings_file"
+                show_file_paged "Network settings" "$settings_file"
+                rm -f -- "$settings_file"
+                ;;
+            0) return 0 ;;
+            *) warn "Invalid selection."; pause_menu || true ;;
+        esac
+    done
 }
 
 core_menu() {
-    clear_screen
     local choice=""
-    printf '%sBackhaul core%s\n\n' "$BH_CYAN" "$BH_RESET"
-    menu_select choice "Selection" \
-        "1|Show core version and hash" \
-        "2|Install or update the official Backhaul core" \
-        "0|Back" || return 0
-    case "$choice" in
-        1)
-            if [[ -x "$BH_BIN" ]]; then
-                "$BH_BIN" --version 2>/dev/null || true
-                sha256sum "$BH_BIN"
-            else
-                warn "The Backhaul core is not installed."
-            fi
-            ;;
-        2) update_backhaul ;;
-        0) return 0 ;;
-        *) warn "Invalid selection." ;;
-    esac
-    pause_menu || true
+    while true; do
+        clear_screen
+        printf '%sBackhaul core%s\n\n' "$BH_CYAN" "$BH_RESET"
+        menu_select choice "Selection" \
+            "1|Show core version and hash" \
+            "2|Install or update the official Backhaul core" \
+            "0|Back" || return 0
+        case "$choice" in
+            1)
+                if [[ -x "$BH_BIN" ]]; then
+                    "$BH_BIN" --version 2>/dev/null || true
+                    sha256sum "$BH_BIN"
+                else
+                    warn "The Backhaul core is not installed."
+                fi
+                pause_menu || true
+                ;;
+            2) update_backhaul; pause_menu || true ;;
+            0) return 0 ;;
+            *) warn "Invalid selection."; pause_menu || true ;;
+        esac
+    done
 }
 
 update_backhaul() {
