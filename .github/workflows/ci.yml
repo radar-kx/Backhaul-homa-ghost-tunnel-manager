@@ -28,6 +28,7 @@ jobs:
             lib/common.sh \
             bin/backhaul-manager \
             bin/backhaul-menu \
+            bin/homa \
             bin/bh \
             tests/run.sh \
             tests/health_repair.sh \

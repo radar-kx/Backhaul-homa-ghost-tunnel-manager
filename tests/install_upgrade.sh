@@ -22,7 +22,8 @@ export BH_SYSTEMD_DIR="$TEST_ROOT/etc/systemd/system"
 export BH_PROJECT_DIR="$TEST_ROOT/opt/backhaul-tunnel-manager"
 export BH_MANAGER_BIN="$TEST_ROOT/usr/local/sbin/backhaul-manager"
 export BH_MENU_BIN="$TEST_ROOT/usr/local/sbin/backhaul-menu"
-export BH_SHORTCUT_BIN="$TEST_ROOT/usr/local/bin/bh"
+export BH_SHORTCUT_BIN="$TEST_ROOT/usr/local/bin/homa"
+export BH_LEGACY_SHORTCUT_BIN="$TEST_ROOT/usr/local/bin/bh"
 export BH_CRON_FILE="$TEST_ROOT/etc/cron.d/backhaul-manager-health"
 export BH_BACKUP_DIR="$TEST_ROOT/var/backups/backhaul-manager"
 
@@ -39,9 +40,12 @@ after_hash="$(sha256sum "$BH_BIN" | awk '{print $1}')"
 [[ -x "$BH_MANAGER_BIN" ]]
 [[ -x "$BH_MENU_BIN" ]]
 [[ -x "$BH_SHORTCUT_BIN" ]]
+[[ -x "$BH_LEGACY_SHORTCUT_BIN" ]]
+"$BH_SHORTCUT_BIN" version | grep -q '1.1.13'
+"$BH_LEGACY_SHORTCUT_BIN" version | grep -q '1.1.13'
 [[ "$(stat -c '%a' "$BH_PROJECT_DIR")" == "750" ]]
 grep -q '^\*/5 ' "$BH_CRON_FILE"
-"$BH_MANAGER_BIN" version | grep -q '1.1.11'
+"$BH_MANAGER_BIN" version | grep -q '1.1.13'
 
 printf '\n# rollback-sentinel\n' >>"$BH_PROJECT_DIR/lib/common.sh"
 printf '\n# rollback-sentinel\n' >>"$BH_MANAGER_BIN"
@@ -87,7 +91,7 @@ kill -0 "$sentinel_pid"
 [[ "$(sha256sum "$BH_BIN" | awk '{print $1}')" == "$before_hash" ]]
 [[ "$(sha256sum "$config" | awk '{print $1}')" == "$config_hash_before" ]]
 [[ "$(sha256sum "$unit" | awk '{print $1}')" == "$unit_hash_before" ]]
-"$BH_MANAGER_BIN" version | grep -q '1.1.11'
+"$BH_MANAGER_BIN" version | grep -q '1.1.13'
 
 set +e
 "$ROOT_DIR/install.sh" --skip-binary --force-binary >/dev/null 2>&1

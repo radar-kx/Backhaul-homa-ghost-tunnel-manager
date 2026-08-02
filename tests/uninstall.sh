@@ -13,7 +13,8 @@ export BH_SYSTEMD_DIR="$TEST_ROOT/etc/systemd/system"
 export BH_PROJECT_DIR="$TEST_ROOT/opt/backhaul-tunnel-manager"
 export BH_MANAGER_BIN="$TEST_ROOT/usr/local/sbin/backhaul-manager"
 export BH_MENU_BIN="$TEST_ROOT/usr/local/sbin/backhaul-menu"
-export BH_SHORTCUT_BIN="$TEST_ROOT/usr/local/bin/bh"
+export BH_SHORTCUT_BIN="$TEST_ROOT/usr/local/bin/homa"
+export BH_LEGACY_SHORTCUT_BIN="$TEST_ROOT/usr/local/bin/bh"
 export BH_CRON_FILE="$TEST_ROOT/etc/cron.d/backhaul-manager-health"
 export BH_BACKUP_DIR="$TEST_ROOT/var/backups/backhaul-manager"
 
@@ -30,6 +31,7 @@ create_fixture() {
     printf 'manager\n' >"$BH_MANAGER_BIN"
     printf 'menu\n' >"$BH_MENU_BIN"
     printf 'shortcut\n' >"$BH_SHORTCUT_BIN"
+    printf 'legacy shortcut\n' >"$BH_LEGACY_SHORTCUT_BIN"
     printf 'project\n' >"$BH_PROJECT_DIR/README"
     printf 'cron\n' >"$BH_CRON_FILE"
     tee "$BH_CONFIG_DIR/test-client.toml" >/dev/null <<'EOF'
@@ -65,7 +67,8 @@ create_fixture
 [[ -e "$BH_SYSTEMD_DIR/backhaul-test-client.service" ]] ||
     fail "default uninstall removed a unit"
 [[ ! -e "$BH_MANAGER_BIN" && ! -e "$BH_MENU_BIN" &&
-   ! -e "$BH_SHORTCUT_BIN" && ! -e "$BH_PROJECT_DIR" ]] ||
+   ! -e "$BH_SHORTCUT_BIN" && ! -e "$BH_LEGACY_SHORTCUT_BIN" &&
+   ! -e "$BH_PROJECT_DIR" ]] ||
     fail "default uninstall left Manager files behind"
 [[ ! -e "$BH_CRON_FILE" ]] ||
     fail "default uninstall left the Manager cron file behind"

@@ -9,7 +9,8 @@ PROJECT_DIR="${BH_PROJECT_DIR:-/opt/backhaul-tunnel-manager}"
 CORE_BIN="${BH_BIN:-/usr/local/bin/backhaul}"
 MANAGER_BIN="${BH_MANAGER_BIN:-/usr/local/sbin/backhaul-manager}"
 MENU_BIN="${BH_MENU_BIN:-/usr/local/sbin/backhaul-menu}"
-SHORTCUT_BIN="${BH_SHORTCUT_BIN:-/usr/local/bin/bh}"
+SHORTCUT_BIN="${BH_SHORTCUT_BIN:-/usr/local/bin/homa}"
+LEGACY_SHORTCUT_BIN="${BH_LEGACY_SHORTCUT_BIN:-/usr/local/bin/bh}"
 CRON_FILE="${BH_CRON_FILE:-/etc/cron.d/backhaul-manager-health}"
 BACKUP_ROOT="${BH_BACKUP_DIR:-/var/backups/backhaul-manager}"
 
@@ -49,6 +50,7 @@ validate_absolute_target "$CORE_BIN" "Backhaul core path"
 validate_absolute_target "$MANAGER_BIN" "Manager executable path"
 validate_absolute_target "$MENU_BIN" "menu executable path"
 validate_absolute_target "$SHORTCUT_BIN" "shortcut executable path"
+validate_absolute_target "$LEGACY_SHORTCUT_BIN" "legacy shortcut executable path"
 validate_absolute_target "$CRON_FILE" "cron file path"
 
 PURGE_ALL=0
@@ -147,7 +149,7 @@ if [[ -e "$CRON_FILE" ]]; then
 fi
 
 rm -rf -- "$PROJECT_DIR"
-rm -f -- "$MANAGER_BIN" "$MENU_BIN" "$SHORTCUT_BIN"
+rm -f -- "$MANAGER_BIN" "$MENU_BIN" "$SHORTCUT_BIN" "$LEGACY_SHORTCUT_BIN"
 
 if ((PURGE_ALL == 1)); then
     printf '[OK] Manager, tunnels, and core were removed. Backup: %s\n' "$BACKUP_DIR"

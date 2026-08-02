@@ -4,7 +4,7 @@ A safe, English-language CLI and interactive menu for installing and managing
 multiple independent [Backhaul](https://github.com/Musixal/Backhaul) tunnels on
 Ubuntu and Debian.
 
-Version `1.1.11` can create new server/client tunnels and discover existing or
+Version `1.1.13` can create new server/client tunnels and discover existing or
 legacy `backhaul-*.service` units without rewriting their configuration.
 
 ## Highlights
@@ -13,9 +13,10 @@ legacy `backhaul-*.service` units without rewriting their configuration.
 - IPv4 and bracketed IPv6 endpoints
 - `tcp`, `tcpmux`, `ws`, `wss`, `wsmux`, and `wssmux`
 - Mobile-terminal menu with arrow-key and numeric navigation
-- Incremental two-row selection repaint to avoid full-menu flashing in Termius
-- Temporary status/backup pages are cleared on return without polluting scrollback
+- Alternate-screen UI that restores the original shell and scrollback on exit
+- Coalesced arrow-key bursts to avoid redundant repaints in Termius/MobaXterm
 - Compact rendering down to 12 rows and 20 columns without option wrapping
+- Mobile status summary, formatted live logs, diagnostics pagination, and Port Monitor
 - Transactional config/unit deployment with automatic rollback
 - Conditional health checks that do not restart healthy services
 - Versioned backups and transactional restore with a pre-restore safety backup
@@ -37,7 +38,7 @@ bash <(curl -fsSL --ipv4 \
 Then run:
 
 ```bash
-sudo bh
+sudo homa
 ```
 
 ## Fresh installation
@@ -79,20 +80,20 @@ should not be used unless the file was validated independently.
 ## Useful commands
 
 ```bash
-sudo bh list
-sudo bh health --repair
-sudo bh cron status
-sudo bh backup create
-sudo bh backup list
-sudo bh backup restore /var/backups/backhaul-manager/BACKUP.tar.gz --yes
-sudo bh binary install --latest
-sudo bh doctor
+sudo homa list
+sudo homa health --repair
+sudo homa cron status
+sudo homa backup create
+sudo homa backup list
+sudo homa backup restore /var/backups/backhaul-manager/BACKUP.tar.gz --yes
+sudo homa binary install --latest
+sudo homa doctor
 ```
 
 ## Create a Server
 
 ```bash
-sudo bh server add \
+sudo homa server add \
   --name tr \
   --bind 0.0.0.0:9300 \
   --public-host 203.0.113.10 \
@@ -108,7 +109,7 @@ The generated Client command contains the tunnel token. Keep it private.
 ## Create a Client
 
 ```bash
-sudo bh client add \
+sudo homa client add \
   --name tr \
   --remote 203.0.113.10:9300 \
   --transport wsmux \
@@ -132,7 +133,8 @@ are restored.
 | Path | Purpose |
 |---|---|
 | `/usr/local/bin/backhaul` | Backhaul core |
-| `/usr/local/bin/bh` | Short menu/CLI command |
+| `/usr/local/bin/homa` | Primary menu/CLI command |
+| `/usr/local/bin/bh` | Legacy compatibility alias |
 | `/usr/local/sbin/backhaul-manager` | CLI manager |
 | `/usr/local/sbin/backhaul-menu` | Interactive menu |
 | `/opt/backhaul-tunnel-manager` | Installed Manager files |

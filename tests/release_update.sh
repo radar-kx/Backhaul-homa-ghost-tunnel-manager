@@ -118,7 +118,8 @@ env \
     BH_PROJECT_DIR="$INSTALL_ROOT/opt/backhaul-tunnel-manager" \
     BH_MANAGER_BIN="$INSTALL_ROOT/usr/local/sbin/backhaul-manager" \
     BH_MENU_BIN="$INSTALL_ROOT/usr/local/sbin/backhaul-menu" \
-    BH_SHORTCUT_BIN="$INSTALL_ROOT/usr/local/bin/bh" \
+    BH_SHORTCUT_BIN="$INSTALL_ROOT/usr/local/bin/homa" \
+    BH_LEGACY_SHORTCUT_BIN="$INSTALL_ROOT/usr/local/bin/bh" \
     BH_CRON_FILE="$INSTALL_ROOT/etc/cron.d/backhaul-manager-health" \
     BH_BACKUP_DIR="$INSTALL_ROOT/var/backups/backhaul-manager" \
     BH_GITHUB_API_BASE="file://$API_ROOT" \

@@ -118,6 +118,12 @@ printf 'test-value\n'
 EOF
 chmod 755 "$TEST_ROOT/fake-bin/sysctl"
 
+tee "$TEST_ROOT/fake-bin/curl" >/dev/null <<'EOF'
+#!/usr/bin/env bash
+exit 22
+EOF
+chmod 755 "$TEST_ROOT/fake-bin/curl"
+
 export PATH="$TEST_ROOT/fake-bin:$PATH"
 
 server_config="$BH_CONFIG_DIR/de-server.toml"
@@ -154,7 +160,7 @@ assert_contains() {
 
 main_output="$(run_menu '0\n')"
 assert_contains "$main_output" 'HOMA GHOST TUNNEL MANAGER'
-assert_contains "$main_output" 'Manager version: 1.1.11'
+assert_contains "$main_output" 'Manager version: 1.1.13'
 assert_contains "$main_output" 'Create a new tunnel (IPv4 / IPv6)'
 assert_contains "$main_output" 'Update Manager from GitHub'
 
@@ -177,17 +183,19 @@ run_menu \
 
 status_output="$(run_menu '2\n1\n\n0\n0\n')"
 assert_contains "$status_output" 'Tunnel management: backhaul-de-server.service'
-assert_contains "$status_output" 'Status: active'
+assert_contains "$status_output" 'Service: active'
+assert_contains "$status_output" 'Boot: enabled'
+assert_contains "$status_output" 'Current: active'
 
-logs_output="$(run_menu '2\n2\n\n0\n0\n')"
+logs_output="$(run_menu '2\n2\n0\n0\n')"
 assert_contains "$logs_output" 'Fake journal output.'
 
-run_menu '2\n3\ny\n\n0\n0\n' >/dev/null
+run_menu '2\n3\ny\nYES\n\n0\n0\n' >/dev/null
 run_menu '2\n4\n1\n\n0\n0\n' >/dev/null
 run_menu '2\n4\n2\nn\n0\n0\n' >/dev/null
-run_menu '2\n4\n3\n\n0\n0\n' >/dev/null
+run_menu '2\n4\n3\ny\nYES\n\n0\n0\n' >/dev/null
 run_menu '2\n4\n4\n\n0\n0\n' >/dev/null
-run_menu '2\n4\n5\ny\n\n0\n0\n' >/dev/null
+run_menu '2\n4\n5\ny\nYES\n\n0\n0\n' >/dev/null
 run_menu '2\n5\n1\n\n0\n0\n' >/dev/null
 run_menu '2\n5\n2\n8201=127.0.0.1:8091\ny\n\n0\n0\n' >/dev/null
 run_menu '2\n5\n3\n8200\ny\n\n0\n0\n' >/dev/null
@@ -197,6 +205,11 @@ assert_contains "$config_output" '***REDACTED***'
 if grep -Fq '0123456789abcdef0123456789abcdef' <<<"$config_output"; then
     fail "safe config view exposed the token"
 fi
+
+monitor_output="$(run_menu '2\n9\nq0\n0\n')"
+assert_contains "$monitor_output" 'Port Monitor: backhaul-de-server.service'
+assert_contains "$monitor_output" 'Local listener'
+assert_contains "$monitor_output" 'Active connections:'
 
 run_menu '2\n7\nn\n0\n0\n' >/dev/null
 invalid_output="$(run_menu '2\ninvalid\n\n0\n0\n')"
@@ -217,11 +230,19 @@ run_menu '6\n2\n\n0\n' >/dev/null
 diagnostic_output="$(run_menu '7\n1\n\n0\n')"
 assert_contains "$diagnostic_output" 'Diagnostics completed.'
 listening_output="$(run_menu '7\n2\n\n0\n')"
-assert_contains "$listening_output" 'No local Backhaul listening port was found.'
+assert_contains "$listening_output" 'Listening port: none'
 connections_output="$(run_menu '7\n3\n\n0\n')"
-assert_contains "$connections_output" 'No active Backhaul TCP connection was found.'
+assert_contains "$connections_output" 'State: Disconnected'
 network_output="$(run_menu '7\n4\n\n0\n')"
-assert_contains "$network_output" 'No settings were changed by this option.'
+assert_contains "$network_output" 'Read-only: no setting was changed.'
+
+config_hash_before_read_only="$(sha256sum "$server_config" | awk '{print $1}')"
+unit_hash_before_read_only="$(sha256sum "$server_unit" | awk '{print $1}')"
+run_menu '2\n1\n\n0\n7\n2\n\n3\n\n4\n\n0\n0\n' >/dev/null
+[[ "$(sha256sum "$server_config" | awk '{print $1}')" == "$config_hash_before_read_only" ]] ||
+    fail "a read-only menu changed the tunnel config"
+[[ "$(sha256sum "$server_unit" | awk '{print $1}')" == "$unit_hash_before_read_only" ]] ||
+    fail "a read-only menu changed the systemd unit"
 
 core_output="$(run_menu '8\n1\n\n0\n')"
 assert_contains "$core_output" 'backhaul v0.7.2'

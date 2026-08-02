@@ -29,7 +29,7 @@ This is a security stop. Verify server time, DNS, and access to `api.github.com`
 and `github.com`, then retry:
 
 ```bash
-sudo bh binary install --latest
+sudo homa binary install --latest
 ```
 
 `--allow-unverified-download` explicitly bypasses release-hash verification and
@@ -42,7 +42,7 @@ causes automatic rollback. Inspect both the current and previous boot logs:
 
 ```bash
 sudo journalctl -u backhaul-NAME-client.service -n 200 --no-pager
-sudo bh health
+sudo homa health
 ```
 
 ## Backup restore is rejected
@@ -67,7 +67,7 @@ reports stale row/column dimensions.
 Check both the mapping and the local Xray listener:
 
 ```bash
-sudo bh mapping list backhaul-NAME-server.service
+sudo homa mapping list backhaul-NAME-server.service
 ss -lntp | grep -E ':(8090|8091|8092)[[:space:]]'
 ```
 ## Menu flashing or stale pages in Termius
@@ -76,4 +76,3 @@ Since version 1.1.11, arrow navigation repaints only the previous and current
 selection rows. Status, health, and backup pages are also erased in place after
 Enter, so they do not appear above the next menu. Scrollback from before `bh` is
 intentionally preserved.
-

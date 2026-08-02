@@ -19,9 +19,9 @@ bash <(curl -fsSL --ipv4 \
 Validate:
 
 ```bash
-sudo bh list
-sudo bh health
-sudo bh cron status
+sudo homa list
+sudo homa health
+sudo homa cron status
 pgrep -a backhaul
 ```
 
@@ -32,9 +32,9 @@ Existing Backhaul PIDs should remain unchanged during a Manager-only upgrade.
 Create a backup and update one low-risk Client first:
 
 ```bash
-sudo bh backup create
-sudo bh binary install --latest
-sudo bh health
+sudo homa backup create
+sudo homa binary install --latest
+sudo homa health
 ```
 
 The release asset digest is checked before extraction. Services that were active
@@ -45,16 +45,16 @@ previous binary and service states are restored.
 ## Restore a backup
 
 ```bash
-sudo bh backup list
-sudo bh backup restore /var/backups/backhaul-manager/BACKUP.tar.gz --yes
+sudo homa backup list
+sudo homa backup restore /var/backups/backhaul-manager/BACKUP.tar.gz --yes
 ```
 
 Restore creates another safety backup before changing live files. Verify all
 units and logs afterwards:
 
 ```bash
-sudo bh list
-sudo bh health
+sudo homa list
+sudo homa health
 sudo journalctl -u backhaul-NAME-client.service -n 100 --no-pager
 ```
 

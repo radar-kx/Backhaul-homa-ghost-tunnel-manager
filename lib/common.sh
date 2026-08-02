@@ -4,7 +4,7 @@
 # The color variables are intentionally consumed by scripts that source this file.
 # shellcheck disable=SC2034
 
-BH_MANAGER_VERSION="${BH_MANAGER_VERSION:-1.1.11}"
+BH_MANAGER_VERSION="${BH_MANAGER_VERSION:-1.1.13}"
 BH_VERSION_DEFAULT="${BH_VERSION_DEFAULT:-v0.7.2}"
 BH_UPSTREAM_REPO="${BH_UPSTREAM_REPO:-Musixal/Backhaul}"
 BH_GITHUB_API_BASE="${BH_GITHUB_API_BASE:-https://api.github.com}"
@@ -17,7 +17,8 @@ BH_SYSTEMD_DIR="${BH_SYSTEMD_DIR:-/etc/systemd/system}"
 BH_PROJECT_DIR="${BH_PROJECT_DIR:-/opt/backhaul-tunnel-manager}"
 BH_MANAGER_BIN="${BH_MANAGER_BIN:-/usr/local/sbin/backhaul-manager}"
 BH_MENU_BIN="${BH_MENU_BIN:-/usr/local/sbin/backhaul-menu}"
-BH_SHORTCUT_BIN="${BH_SHORTCUT_BIN:-/usr/local/bin/bh}"
+BH_SHORTCUT_BIN="${BH_SHORTCUT_BIN:-/usr/local/bin/homa}"
+BH_LEGACY_SHORTCUT_BIN="${BH_LEGACY_SHORTCUT_BIN:-/usr/local/bin/bh}"
 BH_CRON_FILE="${BH_CRON_FILE:-/etc/cron.d/backhaul-manager-health}"
 BH_BACKUP_DIR="${BH_BACKUP_DIR:-/var/backups/backhaul-manager}"
 BH_RAW_BASE="${BH_RAW_BASE:-https://raw.githubusercontent.com/radar-kx/Backhaul-homa-ghost-tunnel-manager/main}"
@@ -237,6 +238,59 @@ validate_ipv4() {
     done
 }
 
+validate_ipv6() {
+    local value="$1"
+    local left="" right="" remainder=""
+    local -a groups=()
+    local group
+
+    [[ -n "$value" && "$value" == *:* && "$value" =~ ^[0-9A-Fa-f:]+$ ]] ||
+        return 1
+    [[ "$value" != *:::* ]] || return 1
+
+    if [[ "$value" == *::* ]]; then
+        remainder="${value#*::}"
+        [[ "$remainder" != *::* ]] || return 1
+        left="${value%%::*}"
+        right="$remainder"
+        groups=()
+        if [[ -n "$left" ]]; then
+            IFS=':' read -r -a groups <<<"$left"
+        fi
+        if [[ -n "$right" ]]; then
+            local -a right_groups=()
+            IFS=':' read -r -a right_groups <<<"$right"
+            groups+=("${right_groups[@]}")
+        fi
+        # The double colon must compress at least one 16-bit group.
+        ((${#groups[@]} < 8)) || return 1
+    else
+        [[ "$value" != :* && "$value" != *: ]] || return 1
+        IFS=':' read -r -a groups <<<"$value"
+        ((${#groups[@]} == 8)) || return 1
+    fi
+
+    for group in "${groups[@]}"; do
+        [[ "$group" =~ ^[0-9A-Fa-f]{1,4}$ ]] || return 1
+    done
+}
+
+validate_hostname() {
+    local value="$1"
+    local -a labels=()
+    local label
+
+    ((${#value} >= 1 && ${#value} <= 253)) || return 1
+    [[ "$value" != .* && "$value" != *. && "$value" != *..* ]] || return 1
+    [[ "$value" =~ ^[A-Za-z0-9.-]+$ ]] || return 1
+    IFS='.' read -r -a labels <<<"$value"
+    for label in "${labels[@]}"; do
+        ((${#label} >= 1 && ${#label} <= 63)) || return 1
+        [[ "$label" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$ ]] ||
+            return 1
+    done
+}
+
 validate_host() {
     local value="$1"
     if [[ "$value" =~ ^[0-9.]+$ ]]; then
@@ -244,10 +298,12 @@ validate_host() {
             die "Invalid IPv4 address: $value"
         return 0
     fi
-    if [[ "$value" =~ ^\[[0-9A-Fa-f:]+\]$ && "$value" == *:* ]]; then
+    if [[ "$value" == \[*\] ]]; then
+        validate_ipv6 "${value:1:${#value}-2}" ||
+            die "Invalid IPv6 address: $value"
         return 0
     fi
-    if [[ "$value" =~ ^[A-Za-z0-9._-]+$ ]]; then
+    if validate_hostname "$value"; then
         return 0
     fi
     die "Invalid IP address or domain. Write IPv6 addresses inside brackets: $value"
@@ -291,8 +347,9 @@ validate_bind() {
     if [[ "$host" =~ ^[0-9.]+$ ]]; then
         validate_ipv4 "$host" ||
             die "Invalid bind IPv4 address: $host"
-    elif [[ "$host" =~ ^\[[0-9A-Fa-f:]+\]$ && "$host" == *:* ]]; then
-        :
+    elif [[ "$host" == \[*\] ]]; then
+        validate_ipv6 "${host:1:${#host}-2}" ||
+            die "Invalid bind IPv6 address: $host"
     else
         die "Invalid bind IP address: $host"
     fi

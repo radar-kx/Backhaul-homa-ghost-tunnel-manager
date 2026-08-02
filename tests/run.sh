@@ -16,7 +16,8 @@ export BH_SYSTEMD_DIR="$TEST_ROOT/etc/systemd/system"
 export BH_PROJECT_DIR="$ROOT_DIR"
 export BH_MANAGER_BIN="$ROOT_DIR/bin/backhaul-manager"
 export BH_MENU_BIN="$ROOT_DIR/bin/backhaul-menu"
-export BH_SHORTCUT_BIN="$ROOT_DIR/bin/bh"
+export BH_SHORTCUT_BIN="$ROOT_DIR/bin/homa"
+export BH_LEGACY_SHORTCUT_BIN="$ROOT_DIR/bin/bh"
 export BH_CRON_FILE="$TEST_ROOT/etc/cron.d/backhaul-manager-health"
 export BH_BACKUP_DIR="$TEST_ROOT/var/backups/backhaul-manager"
 
@@ -28,6 +29,7 @@ bash -n "$ROOT_DIR/uninstall.sh"
 bash -n "$ROOT_DIR/lib/common.sh"
 bash -n "$ROOT_DIR/bin/backhaul-manager"
 bash -n "$ROOT_DIR/bin/backhaul-menu"
+bash -n "$ROOT_DIR/bin/homa"
 bash -n "$ROOT_DIR/bin/bh"
 bash -n "$ROOT_DIR/tests/health_repair.sh"
 bash -n "$ROOT_DIR/tests/install_upgrade.sh"
@@ -38,13 +40,17 @@ bash -n "$ROOT_DIR/tests/uninstall.sh"
 bash -n "$ROOT_DIR/tests/backup_restore.sh"
 bash -n "$ROOT_DIR/tests/binary_rollback.sh"
 bash -n "$ROOT_DIR/tests/release_update.sh"
-python3 - "$ROOT_DIR/tests/menu_pty.py" <<'PY'
+python3 - "$ROOT_DIR/tests/menu_pty.py" "$ROOT_DIR/tests/tomllib_compat.py" <<'PY'
 import pathlib
 import sys
 
-path = pathlib.Path(sys.argv[1])
-compile(path.read_text(), str(path), "exec")
+for argument in sys.argv[1:]:
+    path = pathlib.Path(argument)
+    compile(path.read_text(), str(path), "exec")
 PY
+
+"$ROOT_DIR/bin/homa" version | grep -q '1.1.13'
+"$ROOT_DIR/bin/bh" version | grep -q '1.1.13'
 
 "$ROOT_DIR/bin/backhaul-manager" server add \
     --name turkey \
@@ -88,10 +94,15 @@ printf 'test private key\n' >"$TEST_ROOT/key.pem"
     --tls-key "$TEST_ROOT/key.pem" \
     --map 8500=127.0.0.1:8090
 
-python3 - "$BH_CONFIG_DIR" <<'PY'
+python3 - "$BH_CONFIG_DIR" "$ROOT_DIR/tests" <<'PY'
 import pathlib
 import sys
-import tomllib
+
+try:
+    import tomllib
+except ModuleNotFoundError:
+    sys.path.insert(0, sys.argv[2])
+    import tomllib_compat as tomllib
 
 config_dir = pathlib.Path(sys.argv[1])
 server = tomllib.loads((config_dir / "turkey-server.toml").read_text())
