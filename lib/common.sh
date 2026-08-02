@@ -298,7 +298,7 @@ validate_host() {
             die "Invalid IPv4 address: $value"
         return 0
     fi
-    if [[ "$value" == \[*\] ]]; then
+    if [[ "$value" == '['*']' ]]; then
         validate_ipv6 "${value:1:${#value}-2}" ||
             die "Invalid IPv6 address: $value"
         return 0
@@ -347,7 +347,7 @@ validate_bind() {
     if [[ "$host" =~ ^[0-9.]+$ ]]; then
         validate_ipv4 "$host" ||
             die "Invalid bind IPv4 address: $host"
-    elif [[ "$host" == \[*\] ]]; then
+    elif [[ "$host" == '['*']' ]]; then
         validate_ipv6 "${host:1:${#host}-2}" ||
             die "Invalid bind IPv6 address: $host"
     else

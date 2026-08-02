@@ -682,7 +682,7 @@ active_connection_count() {
     local pid="$1"
     [[ "$pid" =~ ^[1-9][0-9]*$ ]] || { printf '0\n'; return; }
     if command -v ss >/dev/null 2>&1; then
-        ss -Hntp 2>/dev/null | grep -F "pid=$pid," | wc -l
+        ss -Hntp 2>/dev/null | grep -Fc "pid=$pid," || true
     else
         printf 'unknown\n'
     fi
